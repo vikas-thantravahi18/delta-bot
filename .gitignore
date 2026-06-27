@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Secrets / config
+.env
+config.yaml
+
+# Data & outputs
+data/cache/
+results/
+*.log
+*.csv
+!tests/**/*.csv
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/

@@ -1,0 +1,60 @@
+# =====================================================================
+# Delta Exchange trading-bot configuration.
+# Copy to "config.yaml" and tune. config.yaml is git-ignored.
+# =====================================================================
+
+exchange:
+  # "global" -> https://api.delta.exchange
+  # "india"  -> https://api.india.delta.exchange
+  # (the base URL from .env / DELTA_BASE_URL overrides this)
+  region: india
+
+market:
+  symbol: BTCUSD          # Delta perpetual symbol to trade
+  resolution: "1h"        # candle timeframe the strategy runs on
+  # Higher timeframe used only as a trend filter (must be coarser than resolution)
+  trend_resolution: "4h"
+  lot_size: 0.001         # base units per lot/contract (Delta BTCUSD = 0.001 BTC)
+  min_lots: 1             # smallest order the bot will place
+
+account:
+  # Starting balance used by the backtester (in USD/USDT).
+  # The live bot reads the real balance from the exchange instead.
+  starting_balance: 100.0
+
+risk:
+  capital_allocation_pct: 0.50   # only deploy 50% of the balance
+  risk_per_trade_usd: 5.0        # max loss per trade in USD
+  # If risk_per_trade_usd is null, fall back to this % of allocated capital:
+  risk_per_trade_pct: null
+  reward_risk_ratio: 2.0         # 2.0 => 1:2, 3.0 => 1:3
+  max_trades_per_day: 3
+  max_open_positions: 1
+  max_leverage: 10               # cap; position notional <= allocated * leverage
+
+strategy:
+  name: ema_rsi_atr
+  params:
+    ema_fast: 9
+    ema_slow: 21
+    ema_trend: 200          # long-term trend filter on the entry timeframe
+    rsi_period: 14
+    rsi_long_min: 50        # longs require RSI above this
+    rsi_short_max: 50       # shorts require RSI below this
+    rsi_overbought: 75      # skip longs above this (chasing)
+    rsi_oversold: 25        # skip shorts below this
+    atr_period: 14
+    atr_stop_mult: 1.5      # stop distance = atr_stop_mult * ATR
+    use_higher_tf_filter: true
+
+backtest:
+  fee_rate: 0.0005          # 0.05% taker fee per side (Delta-ish)
+  slippage_rate: 0.0002     # 0.02% assumed slippage per fill
+  results_dir: results
+
+live:
+  # SAFETY: dry_run=true never sends real orders. Set to false only when ready,
+  # and the bot will still ask for explicit confirmation at startup.
+  dry_run: true
+  poll_seconds: 60          # how often to evaluate on a closed candle
+  order_type: market_order  # market_order | limit_order

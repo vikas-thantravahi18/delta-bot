@@ -120,6 +120,16 @@ The bot keeps at most `max_open_positions`, respects `max_trades_per_day`, and
 submits a bracket order (entry + stop-loss + take-profit) so every position is
 risk-managed from the moment it opens.
 
+On startup in live mode, the bot also calls Delta's leverage API to set the
+product's leverage to `risk.max_leverage` — this must match what the code
+assumes, otherwise the exchange's real liquidation price can sit closer to
+entry than your stop-loss. Before every signal it also checks that the stop
+distance leaves a safe buffer versus that leverage's liquidation distance,
+and skips the trade (with a logged reason) if not. `risk.trail_distance_r`
+can enable a native trailing stop-loss, but leave it `null` unless you've
+re-backtested it — for this strategy's wide 1:3 reward:risk, a trailing stop
+that can fire before the target cuts the big trend-following winners short.
+
 > Start on **Delta testnet** (`https://testnet-api.delta.exchange` style base URL)
 > or with the smallest possible size until you trust it.
 

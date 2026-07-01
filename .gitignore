@@ -8,7 +8,6 @@ env/
 
 # Secrets / config
 .env
-config.yaml
 
 # Data & outputs
 data/cache/

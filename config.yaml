@@ -1,0 +1,80 @@
+# =====================================================================
+# ACTIVE config (git-ignored). Strategy + timeframe chosen by the robust
+# multi-timeframe search in scripts/optimize.py: positive on 3m/6m/1y/2y
+# AND positive on both train and out-of-sample halves of 2y BTCUSD data.
+# See results/optimize_robust.csv for the full ranking. ~1.9 trades/week.
+# =====================================================================
+
+exchange:
+  region: india
+
+market:
+  symbol: BTCUSD
+  resolution: "30m"       # optimized timeframe (~2 trades/week)
+  trend_resolution: "4h"
+  lot_size: 0.001         # Delta BTCUSD: 1 lot = 0.001 BTC (live bot reads this from API)
+  min_lots: 1             # smallest order the bot will place
+
+account:
+  starting_balance: 100.0
+
+risk:
+  capital_allocation_pct: 0.50   # deploy 50% of the wallet as margin
+  # Risk per trade scales with the wallet: 10% of the 50% allocation
+  # (= 5% of the wallet => $5 on a $100 wallet). Set risk_per_trade_usd: null
+  # to use the percentage instead of a fixed dollar amount.
+  risk_per_trade_usd: null
+  risk_per_trade_pct: 0.10       # 10% of allocated capital
+  reward_risk_ratio: 3.0         # optimizer favoured 1:3 - backtest-confirmed edge;
+                                  # do not lower without re-backtesting (see trail_distance_r note)
+  max_trades_per_day: 3
+  max_open_positions: 1
+  # The bot now explicitly sets this leverage on the exchange via the API
+  # before trading (previously it only assumed the panel matched this
+  # number, which is why real liquidation was landing closer than the
+  # stop-loss). Lowered from 25x: at 25x the liquidation buffer was only
+  # ~1.7% wide - tighter than several of the ATR stops actually taken.
+  max_leverage: 10
+  # Trailing-stop capability exists (Delta's native bracket_trail_amount,
+  # set trail_distance_r to a number of R to enable) but is OFF here.
+  # Backtested 2026-07-02: any trailing distance that can trigger before
+  # the 1:3 target cuts this strategy's big trend-following winners short -
+  # 1y return flips from +177% to as low as -73%. This is a low-win-rate
+  # (30-40%) trend strategy; it needs room to survive pullbacks. Confirms
+  # the earlier 2026-06-28 breakeven+trailing finding. Leave null unless
+  # you've re-backtested a change here.
+  trail_distance_r: null
+
+strategy:
+  name: ema_rsi_atr
+  params:
+    ema_fast: 13               # robust pick (30m)
+    ema_slow: 100              # robust pick (30m)
+    ema_trend: 200
+    rsi_period: 14
+    rsi_long_min: 50
+    rsi_short_max: 50
+    rsi_overbought: 75
+    rsi_oversold: 25
+    atr_period: 14
+    atr_stop_mult: 3.0         # wide, volatility-aware stop
+    use_higher_tf_filter: false  # off gave a more consistent edge on 30m
+
+# (Trailing stop is now implemented for real under risk.trail_distance_r
+# above, via Delta's native bracket_trail_amount. This replaces the old
+# trade_management block, which was never actually wired into the code.)
+
+safety:
+  kill_switch_enabled: true   # pause NEW entries after a bad day/week
+  daily_loss_limit_pct: 0.15  # halt for the day if down 15% from day-start balance
+  weekly_loss_limit_pct: 0.30 # halt for the week if down 30% from week-start balance
+
+backtest:
+  fee_rate: 0.0005
+  slippage_rate: 0.0002
+  results_dir: results
+
+live:
+  dry_run: false
+  poll_seconds: 60
+  order_type: market_order

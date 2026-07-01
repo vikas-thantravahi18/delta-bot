@@ -125,6 +125,21 @@ class DeltaClient:
     def get_positions(self) -> list[dict]:
         return self._request("GET", "/v2/positions/margined", signed=True)
 
+    def get_leverage(self, product_id: int) -> Any:
+        return self._request("GET", f"/v2/products/{product_id}/orders/leverage", signed=True)
+
+    def set_leverage(self, product_id: int, leverage: float) -> Any:
+        """Set the leverage Delta uses for margin/liquidation on this product.
+
+        Must be called before sizing positions off `RiskConfig.max_leverage`,
+        otherwise the exchange may use a stale/default leverage and the
+        actual liquidation price can sit closer than the intended stop-loss.
+        """
+        body = {"leverage": leverage}
+        return self._request(
+            "POST", f"/v2/products/{product_id}/orders/leverage", body=body, signed=True
+        )
+
     def place_order(
         self,
         product_id: int,
@@ -159,8 +174,14 @@ class DeltaClient:
         take_profit_price: float,
         order_type: str = "market_order",
         limit_price: Optional[float] = None,
+        trail_amount: Optional[float] = None,
     ) -> dict:
-        """Entry order with attached stop-loss and take-profit (bracket)."""
+        """Entry order with attached stop-loss and take-profit (bracket).
+
+        `trail_amount`, when set, makes the stop-loss leg a native trailing
+        stop: the exchange ratchets it toward the best price reached by this
+        many price-points, only ever tightening in the trade's favour.
+        """
         body: dict[str, Any] = {
             "product_id": product_id,
             "size": int(size),
@@ -169,6 +190,8 @@ class DeltaClient:
             "bracket_stop_loss_price": str(stop_loss_price),
             "bracket_take_profit_price": str(take_profit_price),
         }
+        if trail_amount:
+            body["bracket_trail_amount"] = str(trail_amount)
         if order_type == "limit_order":
             if limit_price is None:
                 raise DeltaError("limit_price required for limit_order.")

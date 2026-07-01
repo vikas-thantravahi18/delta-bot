@@ -133,6 +133,12 @@ class Backtester:
             if entry >= sig.stop:
                 return None
 
+        # Same guard the live trader applies: skip if the stop is wide
+        # enough that the exchange's own liquidation (at risk.max_leverage)
+        # could plausibly fire before this stop does.
+        if not self.risk.liquidation_buffer_ok(entry, sig.stop):
+            return None
+
         plan: TradePlan | None = self.risk.build_plan(sig.side, entry, sig.stop, balance)
         if plan is None or plan.qty <= 0:
             return None
@@ -141,26 +147,47 @@ class Backtester:
             "side": plan.side,
             "entry": plan.entry,
             "stop": plan.stop,
+            "initial_stop": plan.stop,
             "tp": plan.take_profit,
             "qty": plan.qty,
             "risk_usd": plan.risk_usd,
             "entry_time": bar.name,
             "reason": sig.reason,
+            "trail_amount": plan.trail_amount,
+            "high_water": plan.entry,
+            "low_water": plan.entry,
         }
 
     def _maybe_exit(self, pos, bar, ts, balance, trades) -> tuple[bool, float]:
         high, low = float(bar["high"]), float(bar["low"])
+
+        # Ratchet the stop toward the best price reached, mirroring Delta's
+        # native bracket_trail_amount trailing stop-loss (only ever tightens).
+        if pos.get("trail_amount"):
+            if pos["side"] == "long":
+                pos["high_water"] = max(pos["high_water"], high)
+                candidate = pos["high_water"] - pos["trail_amount"]
+                if candidate > pos["stop"]:
+                    pos["stop"] = candidate
+            else:
+                pos["low_water"] = min(pos["low_water"], low)
+                candidate = pos["low_water"] + pos["trail_amount"]
+                if candidate < pos["stop"]:
+                    pos["stop"] = candidate
+
         exit_price = None
         exit_reason = ""
 
         if pos["side"] == "long":
             if low <= pos["stop"]:                       # stop first (conservative)
-                exit_price, exit_reason = pos["stop"] * (1 - self.slip), "stop"
+                exit_price = pos["stop"] * (1 - self.slip)
+                exit_reason = "trail" if pos["stop"] > pos["initial_stop"] else "stop"
             elif high >= pos["tp"]:
                 exit_price, exit_reason = pos["tp"], "tp"
         else:
             if high >= pos["stop"]:
-                exit_price, exit_reason = pos["stop"] * (1 + self.slip), "stop"
+                exit_price = pos["stop"] * (1 + self.slip)
+                exit_reason = "trail" if pos["stop"] < pos["initial_stop"] else "stop"
             elif low <= pos["tp"]:
                 exit_price, exit_reason = pos["tp"], "tp"
 

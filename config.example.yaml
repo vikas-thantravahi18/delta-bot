@@ -27,10 +27,22 @@ risk:
   risk_per_trade_usd: 5.0        # max loss per trade in USD
   # If risk_per_trade_usd is null, fall back to this % of allocated capital:
   risk_per_trade_pct: null
-  reward_risk_ratio: 2.0         # 2.0 => 1:2, 3.0 => 1:3
+  reward_risk_ratio: 2.0         # 2.0 => 1:2, 3.0 => 1:3 (lower = more reachable, scalpier)
   max_trades_per_day: 3
   max_open_positions: 1
-  max_leverage: 10               # cap; position notional <= allocated * leverage
+  # Cap: position notional <= allocated * leverage. This is ALSO set on the
+  # exchange via the API before trading (DeltaClient.set_leverage), so keep
+  # it conservative enough that 1/leverage stays comfortably wider than your
+  # stop distance - otherwise the exchange's liquidation can trigger before
+  # your stop-loss does.
+  max_leverage: 10
+  # Trail the stop this many R (stop-distance multiples) behind the best
+  # price reached, via Delta's native bracket_trail_amount. null disables
+  # it (static stop only). CAUTION: for trend-following strategies with a
+  # wide reward_risk_ratio, a trail tighter than the target can gut returns
+  # by cutting winners short before they reach the target - backtest any
+  # non-null value here before trading it live.
+  trail_distance_r: null
 
 strategy:
   name: ema_rsi_atr

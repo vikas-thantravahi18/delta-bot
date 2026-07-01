@@ -11,15 +11,31 @@ Mirrors how you size an order in the Delta order panel:
        - margin-based: qty affordable with (allocation * leverage) of notional
   4. Round DOWN to whole lots (Delta trades integer lots; 1 lot = `lot_size` BTC).
   5. If you can't afford the minimum lot within the risk budget -> no trade.
+  6. Skip the trade if the stop is wide enough that the exchange's own
+     liquidation could plausibly trigger before it (see `liquidation_buffer_ok`).
+     The caller must actually set `max_leverage` on the exchange for this
+     assumption to hold (see DeltaClient.set_leverage).
 
 Take-profit is placed at `reward_risk_ratio` x the stop distance (1:2 / 1:3).
+The stop then trails `trail_distance_r` x the stop distance behind the best
+price reached (native exchange-side trailing via `bracket_trail_amount`),
+so profit is locked in progressively instead of requiring the full target.
 """
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from typing import Optional
 
 from .config import RiskConfig
+
+# Conservative, fixed safety knobs for the liquidation guard below. Delta's
+# real maintenance-margin tables are tiered and not exposed here, so we
+# assume a small constant maintenance margin and demand a healthy multiple
+# of headroom between our stop and the estimated liquidation price. This is
+# what stops an exchange-side liquidation firing before our own stop-loss.
+EST_MAINTENANCE_MARGIN_PCT = 0.01
+LIQUIDATION_SAFETY_MULT = 1.5
 
 
 @dataclass
@@ -33,6 +49,7 @@ class TradePlan:
     risk_usd: float      # realised dollars at risk if the stop is hit
     notional: float      # qty * entry
     margin_usd: float    # margin this position will tie up (notional / leverage)
+    trail_amount: Optional[float] = None  # price-distance to trail the stop by (None = off)
 
 
 class RiskManager:
@@ -47,6 +64,22 @@ class RiskManager:
             return float(self.cfg.risk_per_trade_usd)
         allocated = balance * self.cfg.capital_allocation_pct
         return allocated * float(self.cfg.risk_per_trade_pct)
+
+    def liquidation_buffer_ok(self, entry: float, stop: float) -> bool:
+        """Guard against the exchange's isolated-margin liquidation firing
+        before our own stop-loss does.
+
+        Approximates the liquidation distance as
+        ``1/leverage - estimated_maintenance_margin`` and requires the stop
+        to sit safely (with a margin-of-safety multiple) inside that buffer.
+        Caller is expected to actually set this same leverage on the
+        exchange (see DeltaClient.set_leverage) so the assumption holds.
+        """
+        if entry <= 0:
+            return False
+        stop_distance_pct = abs(entry - stop) / entry
+        liq_buffer_pct = (1.0 / self.cfg.max_leverage) - EST_MAINTENANCE_MARGIN_PCT
+        return stop_distance_pct * LIQUIDATION_SAFETY_MULT <= liq_buffer_pct
 
     def build_plan(
         self, side: str, entry: float, stop: float, balance: float
@@ -78,6 +111,10 @@ class RiskManager:
         realised_risk = qty * stop_distance                    # <= risk_budget
         margin_usd = notional / self.cfg.max_leverage
 
+        trail_amount = None
+        if self.cfg.trail_distance_r:
+            trail_amount = stop_distance * float(self.cfg.trail_distance_r)
+
         return TradePlan(
             side=side,
             entry=entry,
@@ -88,4 +125,5 @@ class RiskManager:
             risk_usd=realised_risk,
             notional=notional,
             margin_usd=margin_usd,
+            trail_amount=trail_amount,
         )

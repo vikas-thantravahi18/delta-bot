@@ -43,6 +43,9 @@ class RiskConfig:
     max_trades_per_day: int = 2
     max_open_positions: int = 1
     max_leverage: float = 10.0
+    # Trail the stop this many R (stop-distance multiples) behind the best
+    # price reached. None/0 disables trailing (static stop only).
+    trail_distance_r: Optional[float] = 1.0
 
 
 @dataclass
@@ -114,6 +117,7 @@ class Config:
             max_trades_per_day=int(r.get("max_trades_per_day", 2)),
             max_open_positions=int(r.get("max_open_positions", 1)),
             max_leverage=float(r.get("max_leverage", 10.0)),
+            trail_distance_r=_opt_float(r.get("trail_distance_r", 1.0)),
         )
 
         s = raw.get("strategy", {})
@@ -159,6 +163,10 @@ class Config:
             raise ValueError("Set risk_per_trade_usd or risk_per_trade_pct.")
         if self.risk.max_trades_per_day < 1:
             raise ValueError("risk.max_trades_per_day must be >= 1.")
+        if self.risk.max_leverage <= 0:
+            raise ValueError("risk.max_leverage must be > 0.")
+        if self.risk.trail_distance_r is not None and self.risk.trail_distance_r < 0:
+            raise ValueError("risk.trail_distance_r must be >= 0 (or null to disable).")
 
 
 def _opt_float(value: Any) -> Optional[float]:

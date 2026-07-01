@@ -17,7 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.backtest import Backtester                       # noqa: E402
 from src.backtest.metrics import format_metrics           # noqa: E402
-from src.config import Config, PROJECT_ROOT               # noqa: E402
+from src.config import Config, PROJECT_ROOT, REGION_URLS  # noqa: E402
 from src.data.loader import (                             # noqa: E402
     attach_higher_tf_trend, load_candles, period_to_start_end,
 )
@@ -39,6 +39,13 @@ def main() -> None:
     parser.add_argument("--plot", action="store_true", help="Save equity-curve PNGs")
     parser.add_argument("--no-cache", action="store_true", help="Bypass the candle cache")
     parser.add_argument("--config", default=None, help="Path to a config.yaml")
+    parser.add_argument(
+        "--base-url", default=None,
+        help="Data source for historical candles. Defaults to the PRODUCTION URL "
+             "for your region — backtests deliberately IGNORE DELTA_BASE_URL so a "
+             "testnet/demo live endpoint (which has little history) can't starve "
+             "the backtest and collapse all long periods to the same short window.",
+    )
     args = parser.parse_args()
 
     cfg = Config.load(args.config)
@@ -48,7 +55,10 @@ def main() -> None:
         cfg.market.resolution = args.resolution
     balance = args.balance if args.balance is not None else cfg.starting_balance
 
-    client = DeltaClient(base_url=cfg.exchange.base_url)
+    # Historical candles are public; always fetch them from a data-rich
+    # production endpoint (not the possibly-testnet live-trading DELTA_BASE_URL).
+    data_url = args.base_url or REGION_URLS.get(cfg.exchange.region, REGION_URLS["india"])
+    client = DeltaClient(base_url=data_url)
     strategy = build_strategy(cfg.strategy.name, cfg.strategy.params)
     use_htf = bool(cfg.strategy.params.get("use_higher_tf_filter", False))
 
@@ -56,6 +66,7 @@ def main() -> None:
     results_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"\nStrategy : {cfg.strategy.name}")
+    print(f"Data src : {data_url}")
     print(f"Symbol   : {cfg.market.symbol} @ {cfg.market.resolution} "
           f"(trend filter: {cfg.market.trend_resolution if use_htf else 'off'})")
     print(f"Balance  : ${balance:.2f} | allocation {cfg.risk.capital_allocation_pct:.0%} | "

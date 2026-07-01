@@ -61,6 +61,7 @@ class LiveTrader:
         if self.dry_run:
             log.warning("DRY-RUN mode: no real orders will be placed.")
         else:
+            self._set_leverage(pid)
             bal = self._available_balance()
             log.info("LIVE mode. Available balance ~ $%.2f", bal)
 
@@ -107,6 +108,15 @@ class LiveTrader:
                      last_closed_time, float(df.iloc[last_closed_idx]["close"]))
             return
 
+        if not self.risk.liquidation_buffer_ok(sig.entry, sig.stop):
+            log.warning(
+                "Signal (%s) skipped: stop distance too wide for %gx leverage "
+                "(exchange liquidation could trigger before our stop-loss). "
+                "entry=%.1f stop=%.1f. Lower max_leverage or tighten atr_stop_mult.",
+                sig.side, self.cfg.risk.max_leverage, sig.entry, sig.stop,
+            )
+            return
+
         balance = self._available_balance()
         plan = self.risk.build_plan(sig.side, sig.entry, sig.stop, balance)
         if plan is None:
@@ -126,10 +136,11 @@ class LiveTrader:
     # ------------------------------------------------------------------ #
     def _execute(self, plan, reason: str) -> None:
         side = "buy" if plan.side == "long" else "sell"
+        trail_part = f"trail={plan.trail_amount:.1f} " if plan.trail_amount else ""
         msg = (
             f"{plan.side.upper()} {self.cfg.market.symbol} | {plan.lots} lots "
             f"({plan.qty:.4f} BTC, notional ${plan.notional:.2f}, margin ${plan.margin_usd:.2f}) "
-            f"entry~{plan.entry:.1f} stop={plan.stop:.1f} tp={plan.take_profit:.1f} "
+            f"entry~{plan.entry:.1f} stop={plan.stop:.1f} tp={plan.take_profit:.1f} {trail_part}"
             f"risk=${plan.risk_usd:.2f} | {reason}"
         )
         if self.dry_run:
@@ -144,6 +155,7 @@ class LiveTrader:
             stop_loss_price=round(plan.stop, 1),
             take_profit_price=round(plan.take_profit, 1),
             order_type=self.cfg.live.order_type,
+            trail_amount=round(plan.trail_amount, 1) if plan.trail_amount else None,
         )
         log.info("Order response: %s", resp)
 
@@ -164,6 +176,56 @@ class LiveTrader:
                 ema_period=self.cfg.strategy.params.get("ema_trend", 50),
             )
         return df
+
+    def _set_leverage(self, product_id: int) -> None:
+        """Force the exchange's per-product leverage to match risk.max_leverage.
+
+        Without this, Delta uses whatever leverage was last set for the
+        product (e.g. from manual UI trading), which can be much higher than
+        the config assumes and make the real liquidation price sit closer
+        to entry than the ATR-based stop — i.e. the position gets liquidated
+        before our own stop-loss fires.
+
+        In live mode this is a HARD requirement: if we can neither set the
+        leverage nor confirm it already matches, we ABORT startup rather than
+        trade with an unknown leverage. (Delta blocks leverage changes while a
+        position is open, so we fall back to verifying the current value.)
+        """
+        lev = float(self.cfg.risk.max_leverage)
+        try:
+            self.client.set_leverage(product_id, lev)
+            log.info("Leverage set to %gx for product_id=%s.", lev, product_id)
+            return
+        except Exception as exc:
+            set_err = exc
+
+        # Setting failed (e.g. an open position blocks changes). Fall back to
+        # verifying the CURRENT leverage already matches — if so, we're safe.
+        cur_lev = None
+        try:
+            cur = self.client.get_leverage(product_id)
+            raw = cur.get("leverage") if isinstance(cur, dict) else cur
+            cur_lev = float(raw)
+        except Exception:
+            pass
+
+        if cur_lev is not None and abs(cur_lev - lev) < 1e-9:
+            log.warning(
+                "Could not set leverage (%s), but the exchange already reports "
+                "%gx which matches config — continuing.", set_err, lev,
+            )
+            return
+
+        log.error(
+            "ABORTING: leverage is %s but config requires %gx and the change "
+            "failed (%s). Refusing to trade with unverified leverage — the "
+            "exchange could liquidate before our stop-loss. Set it to %gx "
+            "manually in the Delta UI (or fix the API key's Trading permission), "
+            "then restart.",
+            f"{cur_lev:g}x" if cur_lev is not None else "unknown",
+            lev, set_err, lev,
+        )
+        raise SystemExit(1) from set_err
 
     def _available_balance(self) -> float:
         try:

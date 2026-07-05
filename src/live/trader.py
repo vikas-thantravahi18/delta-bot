@@ -56,8 +56,9 @@ class LiveTrader:
         cv = float(self.product.get("contract_value", self.risk.lot_size) or self.risk.lot_size)
         if cv > 0:
             self.risk.lot_size = cv
-        log.info("Trading %s (product_id=%s, 1 lot=%s BTC) on %s",
-                 self.cfg.market.symbol, pid, self.risk.lot_size, self.cfg.exchange.base_url)
+        self._base = self.cfg.market.symbol.replace("USDT", "").replace("USD", "") or "units"
+        log.info("Trading %s (product_id=%s, 1 lot=%s %s) on %s",
+                 self.cfg.market.symbol, pid, self.risk.lot_size, self._base, self.cfg.exchange.base_url)
         if self.dry_run:
             log.warning("DRY-RUN mode: no real orders will be placed.")
         else:
@@ -137,9 +138,10 @@ class LiveTrader:
     def _execute(self, plan, reason: str) -> None:
         side = "buy" if plan.side == "long" else "sell"
         trail_part = f"trail={plan.trail_amount:.1f} " if plan.trail_amount else ""
+        base = getattr(self, "_base", None) or self.cfg.market.symbol.replace("USDT", "").replace("USD", "")
         msg = (
             f"{plan.side.upper()} {self.cfg.market.symbol} | {plan.lots} lots "
-            f"({plan.qty:.4f} BTC, notional ${plan.notional:.2f}, margin ${plan.margin_usd:.2f}) "
+            f"({plan.qty:.4f} {base}, notional ${plan.notional:.2f}, margin ${plan.margin_usd:.2f}) "
             f"entry~{plan.entry:.1f} stop={plan.stop:.1f} tp={plan.take_profit:.1f} {trail_part}"
             f"risk=${plan.risk_usd:.2f} | {reason}"
         )
@@ -241,13 +243,31 @@ class LiveTrader:
         return self.cfg.starting_balance
 
     def _has_open_position(self) -> bool:
+        """True only if THIS strategy's own market has an open position.
+
+        Scoped by product_id (falling back to symbol) so two bots that share one
+        Delta account — e.g. v2 on BTCUSD + ut_stc on ETHUSD — don't block each
+        other: the BTC bot ignores the ETH bot's position and vice-versa.
+        """
         if self.dry_run:
             return False
         try:
             positions = self.client.get_positions()
+            my_pid = int(self.product["id"]) if self.product and self.product.get("id") is not None else None
+            my_sym = str(self.cfg.market.symbol)
             for p in positions:
-                if int(p.get("size", 0)) != 0:
-                    return True
+                if int(p.get("size", 0) or 0) == 0:
+                    continue
+                pid = p.get("product_id")
+                psym = p.get("product_symbol") or (p.get("product") or {}).get("symbol")
+                if my_pid is not None and pid is not None:
+                    if int(pid) == my_pid:
+                        return True
+                elif psym is not None:
+                    if str(psym) == my_sym:
+                        return True
+                else:
+                    return True  # unknown shape -> be conservative, treat as ours
         except Exception as exc:
             log.warning("Could not fetch positions (%s).", exc)
         return False

@@ -27,6 +27,9 @@ def main() -> None:
                         help="Place REAL orders (otherwise dry-run).")
     parser.add_argument("--once", action="store_true",
                         help="Run a single evaluation tick and exit.")
+    parser.add_argument("--yes", action="store_true",
+                        help="Skip the typed live-trading confirmation "
+                             "(used by run_portfolio.py, which confirms once).")
     parser.add_argument("--config", default=None)
     args = parser.parse_args()
 
@@ -47,10 +50,11 @@ def main() -> None:
               f"risk ${cfg.risk.risk_per_trade_usd}/trade | "
               f"R:R 1:{cfg.risk.reward_risk_ratio:g} | "
               f"max {cfg.risk.max_trades_per_day} trades/day")
-        confirm = input("Type 'I UNDERSTAND' to place real orders: ").strip()
-        if confirm != "I UNDERSTAND":
-            print("Confirmation not given. Exiting.")
-            sys.exit(0)
+        if not args.yes:
+            confirm = input("Type 'I UNDERSTAND' to place real orders: ").strip()
+            if confirm != "I UNDERSTAND":
+                print("Confirmation not given. Exiting.")
+                sys.exit(0)
 
     trader = LiveTrader(cfg, live=live)
     if args.once:

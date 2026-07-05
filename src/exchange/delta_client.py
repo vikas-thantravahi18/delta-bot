@@ -125,6 +125,11 @@ class DeltaClient:
     def get_positions(self) -> list[dict]:
         return self._request("GET", "/v2/positions/margined", signed=True)
 
+    def get_fills(self, page_size: int = 100) -> list[dict]:
+        """Recent trade fills (executions), newest first. Signed."""
+        result = self._request("GET", "/v2/fills", params={"page_size": int(page_size)}, signed=True)
+        return result or []
+
     def get_leverage(self, product_id: int) -> Any:
         return self._request("GET", f"/v2/products/{product_id}/orders/leverage", signed=True)
 

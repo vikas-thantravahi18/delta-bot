@@ -1,0 +1,48 @@
+# =====================================================================
+# v2_dualtrend on BTCUSD 1h  — leg 1 of the two-strategy portfolio.
+# Wallet split: this strategy manages 50% of the account.
+# Risk: 6% of that 50% share per trade (= 3% of the full wallet).
+# Runs alongside config.ut_stc_eth.yaml via scripts/run_portfolio.py.
+# DRY-RUN by default — set live.dry_run: false to trade real money.
+# =====================================================================
+
+exchange:
+  region: india
+
+market:
+  symbol: BTCUSD
+  resolution: "1h"        # v2 is validated on 1h
+  trend_resolution: "4h"  # unused (v2 computes its own trend internally)
+  lot_size: 0.001         # Delta BTCUSD: 1 lot = 0.001 BTC
+  min_lots: 1
+
+account:
+  starting_balance: 100.0  # fallback only; live sizing reads the API balance
+
+risk:
+  capital_allocation_pct: 0.50   # this strategy's 50% share of the wallet
+  risk_per_trade_usd: null
+  risk_per_trade_pct: 0.06       # 6% of the 50% share  (= 3% of full wallet)
+  reward_risk_ratio: 3.0         # RR 1:3 (validated)
+  max_trades_per_day: 4
+  max_open_positions: 1
+  max_leverage: 10
+  trail_distance_r: null         # trailing OFF — trend winners need room
+
+strategy:
+  name: v2_dualtrend
+  params:
+    vwap_prd: 30                 # Donchian period for the VWAP trend state
+    vwap_apt: 20                 # adaptive VWAP half-life (bars)
+    zigzag_len: 200              # Donchian breakout length for the short side
+    stop_mult: 2.0               # 2 x ATR(14) stop
+
+backtest:
+  fee_rate: 0.0005
+  slippage_rate: 0.0002
+  results_dir: results
+
+live:
+  dry_run: false                 # LIVE — real orders (still gated by --live confirmation)
+  poll_seconds: 60
+  order_type: market_order

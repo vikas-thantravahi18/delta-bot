@@ -72,7 +72,8 @@ def main() -> None:
     # --- dashboard (inherits console so it prints its URL + opens the browser) ---
     if importlib.util.find_spec("streamlit") is not None:
         d = subprocess.Popen(
-            [sys.executable, "-m", "streamlit", "run", str(ROOT / "dashboard.py")],
+            [sys.executable, "-m", "streamlit", "run", str(ROOT / "dashboard.py"),
+             "--server.headless", "true", "--server.address", "0.0.0.0"],
             cwd=str(ROOT),
         )
         procs.append(("dashboard", d))

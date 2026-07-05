@@ -167,7 +167,7 @@ if fills:
             "P&L": f.get("realized_pnl") or f.get("pnl") or "",
         })
     if rows:
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
     else:
         st.markdown('<span class="dim">No fills on BTCUSD/ETHUSD yet.</span>', unsafe_allow_html=True)
 elif have_keys:

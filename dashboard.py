@@ -1,13 +1,15 @@
-"""Live monitoring dashboard for the two-strategy portfolio.
+"""Live monitoring dashboard for the portfolio.
 
   pip install streamlit
   streamlit run dashboard.py
 
 Reads your Delta account (balance, open positions, recent fills) and attributes
-every trade to its strategy by MARKET — BTCUSD -> v2, ETHUSD -> ut_stc — because
-the two strategies trade different markets. Works even before the strategies
-place a trade (shows balance + status). Needs DELTA_API_KEY / DELTA_API_SECRET
-in .env for account data; without them it shows public prices only.
+every trade to its BOOK by MARKET — BTCUSD -> v2 + ema_rsi, ETHUSD -> ut_stc.
+The two BTC strategies share one net position and the exchange fills carry no
+strategy tag, so BTC trades are shown as one combined book (they can't be split
+apart after the fact). Works even before any trade (shows balance + status).
+Needs DELTA_API_KEY / DELTA_API_SECRET in .env for account data; without them it
+shows public prices only.
 """
 from __future__ import annotations
 
@@ -19,9 +21,9 @@ import streamlit as st
 from src.config import Config
 from src.exchange import DeltaClient
 
-# map market -> strategy identity
+# map market -> book identity (BTC hosts two strategies on one shared position)
 LEGS = {
-    "BTCUSD": {"name": "v2", "market": "BTCUSD · 1h", "tok": "₿", "color": "#f7931a"},
+    "BTCUSD": {"name": "v2 + ema_rsi", "market": "BTCUSD · 1h + 30m", "tok": "₿", "color": "#f7931a"},
     "ETHUSD": {"name": "ut_stc", "market": "ETHUSD · 4h", "tok": "Ξ", "color": "#7d8cf2"},
 }
 
@@ -91,7 +93,7 @@ data = fetch(client, have_keys)
 top = st.columns([3, 1])
 with top[0]:
     st.markdown("## Delta Bot Monitor")
-    st.markdown('<span class="dim">v2 · BTCUSD &nbsp;+&nbsp; ut_stc · ETHUSD — two-strategy portfolio</span>',
+    st.markdown('<span class="dim">v2 + ema_rsi · BTCUSD &nbsp;+&nbsp; ut_stc · ETHUSD — 3-strategy portfolio</span>',
                 unsafe_allow_html=True)
 with top[1]:
     bal = data["balance"]
@@ -176,5 +178,5 @@ elif have_keys:
 else:
     st.markdown('<span class="dim">Connect API keys to see trade history.</span>', unsafe_allow_html=True)
 
-st.caption("Attribution by market: BTCUSD → v2, ETHUSD → ut_stc. "
+st.caption("Attribution by market: BTCUSD → v2 + ema_rsi (one shared book), ETHUSD → ut_stc. "
            "This dashboard is read-only — it never places or cancels orders.")

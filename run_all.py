@@ -3,13 +3,18 @@
   py run_all.py            # dry-run both strategies + dashboard
   py run_all.py --live      # REAL orders on both + dashboard (one confirmation)
 
-Starts three processes:
+Starts four processes:
   * v2_dualtrend on BTCUSD 1h   (config.v2_btc.yaml)
+  * ema_rsi_atr  on BTCUSD 30m  (config.ema_rsi_btc.yaml)  — shares the BTC slot
   * ut_stc       on ETHUSD 4h   (config.ut_stc_eth.yaml)
   * the Streamlit dashboard      -> http://localhost:8501  (auto-opens browser)
 
-Strategy output is streamed here, prefixed [v2/BTC] / [ut_stc/ETH]. The dashboard
-is read-only (never places orders). Press Ctrl+C once to stop all three.
+The two BTC legs share one net position: a per-market lock (src/live/market_lock.py)
+lets whichever fires first take the slot and makes the other skip while BTC is
+occupied — so there is never a double BTC entry.
+
+Strategy output is streamed here, prefixed [v2/BTC] / [ema/BTC] / [ut_stc/ETH].
+The dashboard is read-only (never places orders). Press Ctrl+C once to stop all.
 """
 from __future__ import annotations
 
@@ -26,6 +31,7 @@ RUN_LIVE = ROOT / "scripts" / "run_live.py"
 
 LEGS = [
     ("v2/BTC", ROOT / "config.v2_btc.yaml"),
+    ("ema/BTC", ROOT / "config.ema_rsi_btc.yaml"),
     ("ut_stc/ETH", ROOT / "config.ut_stc_eth.yaml"),
 ]
 
@@ -46,7 +52,7 @@ def main() -> None:
 
     extra: list[str] = []
     if args.live:
-        print("*** LIVE — v2/BTC + ut_stc/ETH + dashboard ***")
+        print("*** LIVE — v2/BTC + ema/BTC + ut_stc/ETH + dashboard ***")
         print("Both config files must also have live.dry_run: false to place real orders.")
         if input("Type 'I UNDERSTAND' to run BOTH legs live: ").strip() != "I UNDERSTAND":
             print("Confirmation not given. Exiting.")

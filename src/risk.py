@@ -92,14 +92,25 @@ class RiskManager:
         rr = self.cfg.reward_risk_ratio
         take_profit = entry + rr * stop_distance if side == "long" else entry - rr * stop_distance
 
-        # Allocation = 50% of wallet is the margin we're willing to deploy.
+        # Allocation = the share of wallet we're willing to deploy as margin.
         allocated = balance * self.cfg.capital_allocation_pct
         risk_budget = self.risk_amount(balance)
 
-        # Two independent caps on size, in BTC.
-        qty_by_risk = risk_budget / stop_distance              # don't lose > budget
-        qty_by_margin = (allocated * self.cfg.max_leverage) / entry  # must be affordable
-        qty = min(qty_by_risk, qty_by_margin)
+        # Two ways to size, both in base units (BTC/ETH):
+        qty_by_risk = risk_budget / stop_distance                    # lose <= risk budget
+        qty_by_margin = (allocated * self.cfg.max_leverage) / entry  # deploy `allocated` as margin
+
+        if self.cfg.sizing_mode == "margin":
+            # MARGIN mode: deploy `capital_allocation_pct` of the wallet as margin
+            # every trade -> big, fixed-notional positions. The realised dollar
+            # risk (below) then scales with the stop distance and can be large;
+            # the liquidation-buffer guard in the caller still protects against
+            # an exchange liquidation firing before the stop.
+            qty = qty_by_margin
+        else:
+            # RISK mode (default): size so hitting the stop loses <= the risk
+            # budget, but never exceed what the margin allocation can afford.
+            qty = min(qty_by_risk, qty_by_margin)
 
         # Round DOWN to whole lots (exchange only accepts integer lots).
         lots = int(math.floor(qty / self.lot_size))

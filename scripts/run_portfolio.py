@@ -6,11 +6,14 @@
 
 Portfolio
 ---------
-  * v2_dualtrend  on BTCUSD 1h   (config.v2_btc.yaml)     — 50% of wallet, 6% risk
-  * ut_stc        on ETHUSD 4h   (config.ut_stc_eth.yaml) — 50% of wallet, 5% risk
+  * v2_dualtrend  on BTCUSD 1h   (config.v2_btc.yaml)      — BTC slot, 6% risk
+  * ema_rsi_atr   on BTCUSD 30m  (config.ema_rsi_btc.yaml) — shares BTC slot, 5% risk
+  * ut_stc        on ETHUSD 4h   (config.ut_stc_eth.yaml)  — 50% of wallet, 5% risk
 
-Each strategy runs as its OWN isolated subprocess, so a crash in one never stops
-the other. Their output is streamed to this console, prefixed with the strategy
+The two BTC legs share one net position (per-market lock in src/live/market_lock.py):
+whichever fires first takes the slot, the other skips while BTC is occupied — no
+double BTC entry. Each strategy runs as its OWN isolated subprocess, so a crash in
+one never stops the others. Their output is streamed to this console, prefixed with the strategy
 tag. Press Ctrl+C once to stop both cleanly.
 
 Going live requires TWO things (belt-and-braces):
@@ -32,6 +35,7 @@ RUN_LIVE = ROOT / "scripts" / "run_live.py"
 
 LEGS = [
     ("v2/BTC", ROOT / "config.v2_btc.yaml"),
+    ("ema/BTC", ROOT / "config.ema_rsi_btc.yaml"),
     ("ut_stc/ETH", ROOT / "config.ut_stc_eth.yaml"),
 ]
 
@@ -57,7 +61,7 @@ def main() -> None:
     if args.once:
         extra.append("--once")
     if args.live:
-        print("*** LIVE PORTFOLIO — v2/BTC + ut_stc/ETH ***")
+        print("*** LIVE PORTFOLIO — v2/BTC + ema/BTC + ut_stc/ETH ***")
         print("Both config files must ALSO have live.dry_run: false to place real orders.")
         if input("Type 'I UNDERSTAND' to run BOTH legs live: ").strip() != "I UNDERSTAND":
             print("Confirmation not given. Exiting.")

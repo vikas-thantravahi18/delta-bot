@@ -39,6 +39,14 @@ class RiskConfig:
     capital_allocation_pct: float = 0.50
     risk_per_trade_usd: Optional[float] = 5.0
     risk_per_trade_pct: Optional[float] = None
+    # Position-sizing mode:
+    #   "risk"   (default) — size so hitting the stop loses <= the risk budget
+    #                        (capital_allocation_pct x risk_per_trade_pct of wallet),
+    #                        capped by the margin allocation. Small, fixed-RISK.
+    #   "margin"           — deploy capital_allocation_pct of the wallet AS MARGIN
+    #                        every trade (big, fixed-NOTIONAL). The dollar RISK then
+    #                        scales with the stop distance and can be large.
+    sizing_mode: str = "risk"
     reward_risk_ratio: float = 2.0
     max_trades_per_day: int = 2
     max_open_positions: int = 1
@@ -113,6 +121,7 @@ class Config:
             capital_allocation_pct=float(r.get("capital_allocation_pct", 0.50)),
             risk_per_trade_usd=_opt_float(r.get("risk_per_trade_usd", 5.0)),
             risk_per_trade_pct=_opt_float(r.get("risk_per_trade_pct", None)),
+            sizing_mode=str(r.get("sizing_mode", "risk")).lower(),
             reward_risk_ratio=float(r.get("reward_risk_ratio", 2.0)),
             max_trades_per_day=int(r.get("max_trades_per_day", 2)),
             max_open_positions=int(r.get("max_open_positions", 1)),
@@ -161,6 +170,8 @@ class Config:
             raise ValueError("risk.reward_risk_ratio must be > 0.")
         if self.risk.risk_per_trade_usd is None and self.risk.risk_per_trade_pct is None:
             raise ValueError("Set risk_per_trade_usd or risk_per_trade_pct.")
+        if self.risk.sizing_mode not in ("risk", "margin"):
+            raise ValueError("risk.sizing_mode must be 'risk' or 'margin'.")
         if self.risk.max_trades_per_day < 1:
             raise ValueError("risk.max_trades_per_day must be >= 1.")
         if self.risk.max_leverage <= 0:

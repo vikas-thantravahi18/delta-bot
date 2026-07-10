@@ -25,6 +25,7 @@ from ..data.loader import RESOLUTION_SECONDS, attach_higher_tf_trend, load_candl
 from ..exchange import DeltaClient
 from ..risk import RiskManager
 from ..strategies import build_strategy
+from .market_lock import MarketLock, has_fresh_claim, write_claim
 
 log = logging.getLogger("live")
 
@@ -98,6 +99,8 @@ class LiveTrader:
         if self._trades_today >= self.cfg.risk.max_trades_per_day:
             log.info("Daily trade cap reached (%s).", self.cfg.risk.max_trades_per_day)
             return
+        # Fast pre-check (no lock): most ticks are flat, so skip cheaply if a
+        # position is already open before doing any signal work.
         if self._has_open_position():
             log.debug("Position already open; skipping.")
             return
@@ -118,21 +121,39 @@ class LiveTrader:
             )
             return
 
-        balance = self._available_balance()
-        plan = self.risk.build_plan(sig.side, sig.entry, sig.stop, balance)
-        if plan is None:
-            allocated = balance * self.cfg.risk.capital_allocation_pct
-            log.warning(
-                "Signal (%s) skipped: can't size >= %d lot within risk budget. "
-                "wallet=$%.2f allocated(50%%)=$%.2f risk_budget=$%.2f, lot=%s BTC. "
-                "Account likely too small for the current stop distance.",
-                sig.side, self.risk.min_lots, balance, allocated,
-                self.risk.risk_amount(balance), self.risk.lot_size,
-            )
-            return
+        # --- critical section: serialise same-market entries across processes ---
+        # More than one leg may trade this market on ONE account (e.g. v2 + ema_rsi
+        # on BTCUSD). The check-position -> place-order sequence is not atomic
+        # across processes, so hold a per-market lock and RE-CHECK the position
+        # inside it (the authoritative check that closes the double-entry race). A
+        # short entry-claim bridges the exchange's position-propagation lag.
+        symbol = self.cfg.market.symbol
+        with MarketLock(symbol) as locked:
+            if not locked:
+                log.info("[%s] another process holds the %s entry lock; skipping tick.",
+                         last_closed_time, symbol)
+                return
+            if self._has_open_position() or (not self.dry_run and has_fresh_claim(symbol)):
+                log.debug("Position already open (or just claimed) on %s; skipping.", symbol)
+                return
 
-        self._execute(plan, sig.reason)
-        self._trades_today += 1
+            balance = self._available_balance()
+            plan = self.risk.build_plan(sig.side, sig.entry, sig.stop, balance)
+            if plan is None:
+                allocated = balance * self.cfg.risk.capital_allocation_pct
+                log.warning(
+                    "Signal (%s) skipped: can't size >= %d lot within risk budget. "
+                    "wallet=$%.2f allocated(50%%)=$%.2f risk_budget=$%.2f, lot=%s BTC. "
+                    "Account likely too small for the current stop distance.",
+                    sig.side, self.risk.min_lots, balance, allocated,
+                    self.risk.risk_amount(balance), self.risk.lot_size,
+                )
+                return
+
+            self._execute(plan, sig.reason)
+            if not self.dry_run:
+                write_claim(symbol)
+            self._trades_today += 1
 
     # ------------------------------------------------------------------ #
     def _execute(self, plan, reason: str) -> None:

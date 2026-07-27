@@ -26,6 +26,7 @@ from ..exchange import DeltaClient
 from ..risk import RiskManager
 from ..strategies import build_strategy
 from .market_lock import MarketLock, has_fresh_claim, write_claim
+from .notifier import TelegramNotifier
 
 log = logging.getLogger("live")
 
@@ -44,6 +45,11 @@ class LiveTrader:
         )
         # Effective dry-run = config dry_run OR caller did not opt into live.
         self.dry_run = cfg.live.dry_run or not live
+        self.notifier = TelegramNotifier(
+            token=cfg.notify.telegram_token,
+            chat_id=cfg.notify.telegram_chat_id,
+            enabled=cfg.notify.enabled,
+        )
         self.product = None
         self._trades_today = 0
         self._today = None
@@ -168,6 +174,8 @@ class LiveTrader:
         )
         if self.dry_run:
             log.info("[DRY-RUN] would place bracket order: %s", msg)
+            # notify in dry-run too, so you can verify the Telegram wiring end-to-end
+            self.notifier.notify_trade(self.cfg.strategy.name, plan.side, plan.lots)
             return
 
         log.info("[LIVE] placing bracket order: %s", msg)
@@ -181,6 +189,8 @@ class LiveTrader:
             trail_amount=round(plan.trail_amount, 1) if plan.trail_amount else None,
         )
         log.info("Order response: %s", resp)
+        # coded 'anime release' alert on the executed trade (never blocks trading)
+        self.notifier.notify_trade(self.cfg.strategy.name, plan.side, plan.lots)
 
     # ------------------------------------------------------------------ #
     # Helpers

@@ -59,3 +59,7 @@ live:
   dry_run: false                 # LIVE — real orders (still gated by --live confirmation)
   poll_seconds: 60
   order_type: market_order
+
+notify:
+  enabled: true                  # coded trade alerts ON (reads TELEGRAM_BOT_TOKEN/CHAT_ID from .env)
+                                 # (ema_rsi_atr shows up as "Naruto"; see src/live/notifier.py)

@@ -77,6 +77,15 @@ class LiveConfig:
 
 
 @dataclass
+class NotifyConfig:
+    """Telegram trade notifications (coded as 'anime releases'; see live/notifier.py).
+    Credentials come from .env (TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID), never the yaml."""
+    enabled: bool = False
+    telegram_token: str = ""
+    telegram_chat_id: str = ""
+
+
+@dataclass
 class Config:
     exchange: ExchangeConfig
     market: MarketConfig
@@ -85,6 +94,7 @@ class Config:
     backtest: BacktestConfig
     live: LiveConfig
     starting_balance: float = 100.0
+    notify: NotifyConfig = field(default_factory=NotifyConfig)
 
     @classmethod
     def load(cls, path: str | os.PathLike | None = None) -> "Config":
@@ -151,6 +161,13 @@ class Config:
 
         starting_balance = float(raw.get("account", {}).get("starting_balance", 100.0))
 
+        nt = raw.get("notify", {}) or {}
+        notify = NotifyConfig(
+            enabled=bool(nt.get("enabled", False)),
+            telegram_token=os.getenv("TELEGRAM_BOT_TOKEN", ""),
+            telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID", ""),
+        )
+
         cfg = cls(
             exchange=exchange,
             market=market,
@@ -159,6 +176,7 @@ class Config:
             backtest=backtest,
             live=live,
             starting_balance=starting_balance,
+            notify=notify,
         )
         cfg.validate()
         return cfg

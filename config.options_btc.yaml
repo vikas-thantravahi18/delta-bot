@@ -41,7 +41,9 @@ risk:
   risk_per_trade_usd: null
   risk_per_trade_pct: 0.10
   reward_risk_ratio: 1.0
-  max_trades_per_day: 4      # cooldown_hours is the real limiter (12h -> ~2/day)
+  max_trades_per_day: 10     # cooldown removed, so THIS is now the only rate limit.
+                             # Measured: busiest day fires 9 signals; a cap of 4 bit
+                             # on 19.9% of days and silently dropped 112 trades.
   max_open_positions: 1
   max_leverage: 1            # buying options is not leveraged; no liquidation
   trail_distance_r: null
@@ -62,16 +64,37 @@ strategy:
 
     min_hours_to_expiry: 3.0     # skip signals inside 3h of the 12:00 UTC settlement
     close_before_expiry_min: 20  # flatten 20 min before settlement if target unhit
-    cooldown_hours: 12.0         # min gap between entries
-    max_iv: 0.30                 # skip if ATM IV > 30% (breakeven is ~30% for +400)
+    cooldown_hours: 0.0          # REMOVED. Was 12h. Raises the rate from ~42 to ~74
+                                 # trades/month; the ~6.4h average hold is now the
+                                 # real limiter, since only one position runs at a time.
+    max_iv: null                 # OFF. The strike scorer prices what each contract
+                                 # would actually return, so an over-priced one loses
+                                 # the ranking on its own. Set a number to re-enable.
 
-    # --- execution: same-day option books are wide (puts ~2.6%, calls 12-32%) ---
-    max_spread_pct: 12.0         # skip the signal if the book is wider than this
-    entry_cross_pct: 0.15        # limit price = mid x (1 + 15% of half-spread nudge)
-    entry_fill_seconds: 45       # cancel and skip if the limit has not filled
-    strike_pool: 3               # consider the 3 strikes nearest spot, take the
-                                 # tightest book (the exact-ATM strike is often the
-                                 # widest — measured 17.9% vs 5.7% one strike away)
+    # --- strike selection: buy whatever moves most per BTC point ---------------
+    strike_span_points: 3000.0   # search +/- 3000 from spot. Beyond that the books
+                                 # go to 30-63% wide and the score collapses anyway
+                                 # (65,600 call: 63.2% spread, -65% on a 400-pt move).
+    score_hold_hours: 6.0        # reprice the move this far out. Measured hold with
+                                 # no cooldown: mean 6.4h, median 2.9h, p90 19.2h —
+                                 # heavily skewed, so the mean is the fair choice for
+                                 # pricing theta into the score.
+
+    # --- execution -------------------------------------------------------------
+    # Book width measured on the live chain 2026-08-02: 1.0-1.8% near the money,
+    # widening to 9% at 1500 out and 63% at 2500. An earlier reading had same-day
+    # calls at 12-32%, so treat 1-2% as the CURRENT regime, not a constant — the
+    # scorer prices whatever is actually quoted, so it adapts either way.
+    max_spread_pct: 12.0         # a strike wider than this is dropped from scoring
+    entry_order_type: market     # MARKET. Books measured 1-2% wide with ~5,000 lots
+                                 # at the offer against an order of ~66, so crossing
+                                 # is cheap and certain. A limit at these spreads
+                                 # would need an 89-99% fill rate just to break even,
+                                 # and a miss costs the whole trade, not half a
+                                 # spread. Switch to `limit` if books ever widen out.
+    entry_cross_pct: 0.15        # limit mode only: mid + 15% of the half-spread
+    entry_fill_seconds: 45       # how long to wait for a fill before giving up
+    strike_pool: 3               # unused by the scorer; kept so older configs load
 
 backtest:
   fee_rate: 0.0005

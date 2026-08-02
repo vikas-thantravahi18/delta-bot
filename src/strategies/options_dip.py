@@ -9,11 +9,19 @@
              caps the loss, and back-testing showed an underlying stop only
              closed trades that would have recovered (168 of them, 0 the other way).
 
-Measured on 2 years of real Delta 5m candles, traded as same-day ATM options:
-    ~41 trades/month | 69-70% win | +$18.43 per $50 staked (mid fills, 17.7% IV)
+Measured on 2 years of real Delta 5m candles, same-day options, $15 stake, strike
+chosen by the scorer in options_trader rather than fixed at ATM:
 
-The trader enforces a 12h cooldown between entries and skips any signal with
-under 3 hours to the 12:00 UTC settlement.
+    ~75 trades/month | 68-69% win | target reached on 72.1% of trades
+
+$/trade depends almost entirely on what the premium costs, which is why the trader
+now RANKS strikes by what each would return instead of gating on an absolute IV:
+
+    IV ~18%, tight book  +$11.23        IV 27.8%, tight book  +$0.71
+    IV ~18%, wide book    +$9.88        IV 27.8%, wide book   +$0.07
+
+The trader runs with NO cooldown — max_trades_per_day is the only rate limit — and
+skips any signal with under 3 hours to the 12:00 UTC settlement.
 """
 from __future__ import annotations
 

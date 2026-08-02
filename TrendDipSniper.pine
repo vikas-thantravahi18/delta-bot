@@ -1,0 +1,256 @@
+//@version=6
+// ─────────────────────────────────────────────────────────────────────────────
+//  TREND DIP SNIPER — mirrors the LIVE options bot (options_dip)
+//
+//  USE ON THE 5-MINUTE BTC CHART.
+//
+//  This is not a perp bracket. The live bot buys a same-day BTC OPTION, so:
+//    * there is NO STOP-LOSS. The premium you paid is the maximum loss, and
+//      back-testing showed an underlying stop only closed trades that would
+//      have recovered (168 of them, 0 the other way).
+//    * every trade dies at the 12:00 UTC settlement. The bot flattens 20
+//      minutes before that, hit or not.
+//    * a signal with under 3h to settlement is SKIPPED — not enough clock left
+//      for a 400-point move, and theta is brutal in the last hours.
+//
+//  MODEL (identical to config.options_btc.yaml)
+//     regime    EMA50 > EMA200                 -> CALLs only (mirror for PUTs)
+//     trigger   RSI(14) CROSSES down through 40 (the cross, not the state —
+//               the state fires ~38x/day, the cross ~1x/day)
+//     target    +400 points on BTC
+//     exit      target, or 20 min before the 12:00 UTC settlement
+//     spacing   one position at a time, 12h between ENTRIES (not exits)
+//
+//  Measured on 2y of real Delta 5m candles traded as same-day ATM options:
+//     ~41 trades/month | 69-70% win | +$16.54 per $50 staked (2.6% spread)
+//     Losses take ~100% of the premium, wins return ~91% — so the win rate
+//     has to stay above ~55% for this to work at all.
+// ─────────────────────────────────────────────────────────────────────────────
+indicator("Trend Dip Sniper — LIVE BOT (BTC options)", overlay = true,
+     max_boxes_count = 500, max_labels_count = 500, max_lines_count = 500)
+
+// ── inputs ───────────────────────────────────────────────────────────────────
+gS = "Signal  (matches the bot)"
+emaFastLen = input.int(50,  "EMA fast",   minval = 2,  group = gS)
+emaSlowLen = input.int(200, "EMA slow",   minval = 5,  group = gS)
+rsiLen     = input.int(14,  "RSI length", minval = 2,  group = gS)
+rsiBuy     = input.float(40, "RSI buy level (cross DOWN through)", group = gS)
+rsiSell    = input.float(60, "RSI sell level (cross UP through)",  group = gS)
+coolBars   = input.int(144, "Cooldown bars between ENTRIES (144 = 12h on 5m)",
+     minval = 0, group = gS)
+allowLong  = input.bool(true, "Longs (CALLs)",  inline = "sides", group = gS)
+allowShort = input.bool(true, "Shorts (PUTs)", inline = "sides", group = gS)
+
+gT = "Exits  (options — no stop)"
+tpPts       = input.float(400, "Target (BTC points)", minval = 1, group = gT)
+settleHour  = input.int(12, "Daily settlement hour, UTC", minval = 0, maxval = 23,
+     group = gT, tooltip = "Delta BTC options settle at 12:00 UTC every day.")
+closeBefMin = input.int(20, "Flatten this many minutes before settlement",
+     minval = 1, group = gT)
+minHrsToExp = input.float(3.0, "Skip signals with under this many hours left",
+     minval = 0, group = gT)
+
+gV = "Visuals"
+showBox   = input.bool(true, "Show target zone", group = gV)
+tpCol     = input.color(color.new(#26a69a, 76), "Target zone", group = gV)
+riskCol   = input.color(color.new(#ef5350, 82), "Premium at risk", group = gV)
+showLbl   = input.bool(true, "Show BUY / SELL labels", group = gV)
+showTrend = input.bool(true, "Show EMA regime", group = gV)
+showSkip  = input.bool(true, "Mark skipped signals (too close to expiry)", group = gV)
+showStats = input.bool(true, "Show stats table", group = gV)
+
+// ── indicators ───────────────────────────────────────────────────────────────
+emaFast = ta.ema(close, emaFastLen)
+emaSlow = ta.ema(close, emaSlowLen)
+rsiVal  = ta.rsi(close, rsiLen)
+
+upTrend = emaFast > emaSlow
+dnTrend = emaFast < emaSlow
+
+longTrig  = allowLong  and upTrend and ta.crossunder(rsiVal, rsiBuy)
+shortTrig = allowShort and dnTrend and ta.crossover(rsiVal, rsiSell)
+
+// ── hours to the next settlement (the bot's clock) ───────────────────────────
+secsNow    = hour(time, "UTC") * 3600 + minute(time, "UTC") * 60 + second(time, "UTC")
+settleSecs = settleHour * 3600
+hrsToSettle = (secsNow < settleSecs ? settleSecs - secsNow
+                                    : 86400 + settleSecs - secsNow) / 3600.0
+enoughClock = hrsToSettle >= minHrsToExp
+mustFlatten = hrsToSettle * 60.0 <= closeBefMin
+
+// ── position state ───────────────────────────────────────────────────────────
+var int   dir          = 0        // 0 flat, 1 long/CALL, -1 short/PUT
+var float entryPx      = na
+var float tpPx         = na
+var int   entryBar     = na
+var int   lastEntryBar = -1000000 // cooldown runs from ENTRY, like the bot
+var box   tpBox     = na
+var box   riskBox   = na
+var line  entryLine = na
+
+var int   wins     = 0
+var int   expLoss  = 0            // closed at settlement, in the red
+var int   expWin   = 0            // closed at settlement, in the green
+var int   skipped  = 0
+var float ptsTotal = 0.0
+
+cooledDown = (bar_index - lastEntryBar) >= coolBars
+
+// ── manage an open position ──────────────────────────────────────────────────
+hitTP = (dir == 1 and high >= tpPx) or (dir == -1 and low <= tpPx)
+
+if dir != 0
+    if showBox and not na(tpBox)
+        box.set_right(tpBox, bar_index + 1)
+        box.set_right(riskBox, bar_index + 1)
+        line.set_x2(entryLine, bar_index + 1)
+
+    if hitTP
+        wins     += 1
+        ptsTotal += tpPts
+        if showLbl
+            label.new(bar_index, tpPx, "TARGET  +" + str.tostring(tpPts, "#"),
+                 style = dir == 1 ? label.style_label_down : label.style_label_up,
+                 color = color.new(#26a69a, 20), textcolor = color.white,
+                 size = size.tiny)
+        dir := 0
+    else if mustFlatten
+        // the option settles — the bot sells at market whatever it is worth
+        float rp = (close - entryPx) * dir
+        ptsTotal += rp
+        if rp >= 0
+            expWin += 1
+        else
+            expLoss += 1
+        if showBox and not na(tpBox)
+            box.set_bgcolor(tpBox, color.new(color.gray, 92))
+            box.set_bgcolor(riskBox, color.new(color.gray, 92))
+        if showLbl
+            label.new(bar_index, close,
+                 "EXPIRY  " + (rp >= 0 ? "+" : "") + str.tostring(rp, "#"),
+                 style = label.style_label_left,
+                 color = color.new(color.orange, 25), textcolor = color.white,
+                 size = size.tiny)
+        dir := 0
+
+// ── open a new position ──────────────────────────────────────────────────────
+rawSignal = longTrig or shortTrig
+canEnter  = dir == 0 and cooledDown and barstate.isconfirmed
+
+if canEnter and rawSignal and not enoughClock
+    skipped += 1
+    if showSkip
+        label.new(bar_index, longTrig ? low : high,
+             "skip · " + str.tostring(hrsToSettle, "#.#") + "h to expiry",
+             style = longTrig ? label.style_label_up : label.style_label_down,
+             color = color.new(color.gray, 55), textcolor = color.silver,
+             size = size.tiny)
+
+if canEnter and rawSignal and enoughClock
+    dir          := longTrig ? 1 : -1
+    entryPx      := close
+    tpPx         := entryPx + dir * tpPts
+    entryBar     := bar_index
+    lastEntryBar := bar_index
+
+    // the trade must resolve before settlement, so the zone ends there
+    int barsLeft = math.max(1, int((hrsToSettle * 60.0 - closeBefMin) /
+         math.max(timeframe.in_seconds() / 60.0, 1.0)))
+
+    if showBox
+        // green = where the target sits. red = the premium you can lose, which on
+        // an option is the whole stake, not a price level — drawn as a thin band
+        // under the entry purely as a reminder that the downside is total.
+        tpBox := box.new(bar_index, math.max(entryPx, tpPx), bar_index + barsLeft,
+             math.min(entryPx, tpPx), bgcolor = tpCol,
+             border_color = color.new(#26a69a, 45), border_width = 1)
+        riskBox := box.new(bar_index, entryPx, bar_index + barsLeft,
+             entryPx - dir * tpPts * 0.28, bgcolor = riskCol,
+             border_color = color.new(#ef5350, 55), border_width = 1)
+        entryLine := line.new(bar_index, entryPx, bar_index + barsLeft, entryPx,
+             color = color.new(color.white, 30), style = line.style_dashed)
+
+    if showLbl
+        label.new(bar_index, dir == 1 ? low : high,
+             (dir == 1 ? "BUY CALL  " : "BUY PUT  ") +
+             str.tostring(entryPx, format.mintick) +
+             "\nTarget " + str.tostring(tpPx, format.mintick) +
+             "\nNo stop — premium is the risk" +
+             "\n" + str.tostring(hrsToSettle, "#.#") + "h to settlement",
+             style = dir == 1 ? label.style_label_up : label.style_label_down,
+             color = dir == 1 ? color.new(#26a69a, 15) : color.new(#ef5350, 15),
+             textcolor = color.white, size = size.small)
+
+    alert((dir == 1 ? "BUY CALL" : "BUY PUT") + " " + syminfo.ticker +
+         " @ " + str.tostring(entryPx, format.mintick) +
+         " | target " + str.tostring(tpPx, format.mintick) +
+         " | " + str.tostring(hrsToSettle, "#.#") + "h to settlement",
+         alert.freq_once_per_bar_close)
+
+// ── plots ────────────────────────────────────────────────────────────────────
+plot(showTrend ? emaFast : na, "EMA fast", color = color.new(#42a5f5, 30))
+plot(showTrend ? emaSlow : na, "EMA slow", color = color.new(#ab47bc, 30), linewidth = 2)
+bgcolor(showTrend ? (upTrend ? color.new(#26a69a, 96)
+                             : dnTrend ? color.new(#ef5350, 96) : na) : na)
+
+// a faint vertical tint through the daily settlement window
+bgcolor(mustFlatten ? color.new(color.orange, 88) : na, title = "Settlement window")
+
+plotshape(dir == 1 and bar_index == entryBar ? low : na, "Buy call",
+     shape.triangleup, location.absolute, color.new(#26a69a, 0), size = size.tiny)
+plotshape(dir == -1 and bar_index == entryBar ? high : na, "Buy put",
+     shape.triangledown, location.absolute, color.new(#ef5350, 0), size = size.tiny)
+
+alertcondition(longTrig,  "Long signal (CALL)", "Trend Dip Sniper: BUY CALL")
+alertcondition(shortTrig, "Short signal (PUT)", "Trend Dip Sniper: BUY PUT")
+
+// ── stats table ──────────────────────────────────────────────────────────────
+if showStats and barstate.islast
+    int total  = wins + expWin + expLoss
+    int allWin = wins + expWin
+    float wr   = total > 0 ? 100.0 * allWin / total : 0.0
+
+    var table t = table.new(position.top_right, 2, 10,
+         bgcolor = color.new(color.black, 20), border_width = 1,
+         border_color = color.new(color.gray, 60))
+    table.cell(t, 0, 0, "Trend Dip Sniper", text_color = color.white,
+         text_size = size.small, bgcolor = color.new(#1e88e5, 30))
+    table.cell(t, 1, 0, timeframe.period +
+         (timeframe.period == "5" ? "  ✓" : "  ⚠ use 5m"),
+         text_color = timeframe.period == "5" ? color.lime : color.orange,
+         text_size = size.small, bgcolor = color.new(#1e88e5, 30))
+
+    table.cell(t, 0, 1, "Trades", text_color = color.gray, text_size = size.small)
+    table.cell(t, 1, 1, str.tostring(total), text_color = color.white, text_size = size.small)
+
+    table.cell(t, 0, 2, "Hit target", text_color = color.gray, text_size = size.small)
+    table.cell(t, 1, 2, str.tostring(wins), text_color = color.lime, text_size = size.small)
+
+    table.cell(t, 0, 3, "Closed at expiry", text_color = color.gray, text_size = size.small)
+    table.cell(t, 1, 3, str.tostring(expWin) + " up / " + str.tostring(expLoss) + " down",
+         text_color = color.silver, text_size = size.small)
+
+    table.cell(t, 0, 4, "Win rate", text_color = color.gray, text_size = size.small)
+    table.cell(t, 1, 4, str.tostring(wr, "#.0") + "%",
+         text_color = wr >= 55 ? color.lime : color.red, text_size = size.small)
+
+    table.cell(t, 0, 5, "Needs (options)", text_color = color.gray, text_size = size.small)
+    table.cell(t, 1, 5, "~55%", text_color = color.silver, text_size = size.small)
+
+    table.cell(t, 0, 6, "Net points", text_color = color.gray, text_size = size.small)
+    table.cell(t, 1, 6, str.tostring(ptsTotal, "#"),
+         text_color = ptsTotal >= 0 ? color.lime : color.red, text_size = size.small)
+
+    table.cell(t, 0, 7, "Skipped (<" + str.tostring(minHrsToExp, "#.#") + "h)",
+         text_color = color.gray, text_size = size.small)
+    table.cell(t, 1, 7, str.tostring(skipped), text_color = color.orange,
+         text_size = size.small)
+
+    table.cell(t, 0, 8, "Status", text_color = color.gray, text_size = size.small)
+    table.cell(t, 1, 8, dir == 1 ? "CALL open" : dir == -1 ? "PUT open" : "flat",
+         text_color = dir == 0 ? color.silver : color.yellow, text_size = size.small)
+
+    table.cell(t, 0, 9, "Settlement in", text_color = color.gray, text_size = size.small)
+    table.cell(t, 1, 9, str.tostring(hrsToSettle, "#.#") + "h",
+         text_color = hrsToSettle < minHrsToExp ? color.orange : color.silver,
+         text_size = size.small)

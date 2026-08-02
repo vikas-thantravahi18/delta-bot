@@ -92,11 +92,21 @@ class OptionsTrader:
         self.min_hours_to_expiry = float(p.get("min_hours_to_expiry", 3.0))
         self.close_before_expiry_min = float(p.get("close_before_expiry_min", 20.0))
         self.cooldown_hours = float(p.get("cooldown_hours", 12.0))
-        self.max_iv = float(p.get("max_iv", 0.30))
+        # max_iv: null / 0 disables the ceiling entirely. The strike scorer below
+        # already penalises an over-priced contract by pricing what it would
+        # actually return, so an absolute IV threshold is optional.
+        _miv = p.get("max_iv", 0.30)
+        self.max_iv = float(_miv) if _miv else 0.0
         self.max_spread_pct = float(p.get("max_spread_pct", 12.0))
+        # "market" crosses the spread for a guaranteed fill; "limit" rests at
+        # mid + entry_cross_pct of the half-spread and skips the signal if unfilled.
+        self.entry_order_type = str(p.get("entry_order_type", "market")).lower()
         self.entry_cross_pct = float(p.get("entry_cross_pct", 0.15))
         self.entry_fill_seconds = int(p.get("entry_fill_seconds", 45))
         self.strike_pool = int(p.get("strike_pool", 3))
+        # --- strike scoring: pick the contract that gains most on a target move ---
+        self.strike_span_points = float(p.get("strike_span_points", 3000.0))
+        self.score_hold_hours = float(p.get("score_hold_hours", 6.0))
         self.underlying = p.get("underlying", "BTCUSD")
 
         self.dry_run = cfg.live.dry_run or not live
@@ -272,14 +282,28 @@ class OptionsTrader:
                      "(need >= %.1fh).", hrs, self.min_hours_to_expiry)
             return
 
-        pick = self._pick_option(sig.side, hrs)
+        # The strike scorer sizes in lots, so it needs the stake up front. Read the
+        # balance ONCE here and hand it to both steps — two reads could disagree.
+        balance = self._balance()
+        pick = self._pick_option(sig.side, hrs, balance * self.stake_pct)
         if pick is None:
             return
-        self._enter(sig, pick)
+        self._enter(sig, pick, balance)
 
     # ------------------------------------------------------------------ #
-    def _pick_option(self, side: str, hours_left: float) -> Optional[dict]:
-        """Nearest-expiry ATM call/put, with an IV sanity gate."""
+    def _pick_option(self, side: str, hours_left: float,
+                     stake: float) -> Optional[dict]:
+        """Pick the contract that gains the MOST on a full target-sized move.
+
+        Every strike on the front expiry is repriced at spot +/- target_points after
+        the average hold and scored on what `stake` would actually return, after
+        crossing the book on the way in AND out. The winner is the highest score,
+        not the nearest strike: measured live on 2026-08-02, one strike OTM beat ATM
+        on both sides (call 63,400 +$7.61 vs ATM +$7.47; put 62,800 +$7.96 vs ATM
+        +$7.22) because the cheaper contract buys enough extra lots to more than
+        cover its lower delta. Far OTM loses badly — 65,200 scored -$3.24 — so the
+        optimum is an interior point and has to be searched, not assumed.
+        """
         try:
             chain = self.client.get_option_tickers("BTC")
         except Exception as exc:
@@ -316,36 +340,94 @@ class OptionsTrader:
             log.error("No %s options found for expiry %s.", "call" if want_call else "put", tag)
             return None
 
-        # Among the strikes closest to spot, take the one with the TIGHTEST book,
-        # not strictly the nearest. Measured live: the exact-ATM strike is often the
-        # widest (63,000 call 17.9% vs 63,200 call 5.7% at the same moment), and a
-        # 200-point strike shift costs far less than 12 points of spread.
-        cands.sort()
-        pool = cands[:self.strike_pool]
-        def _spread_of(c):
-            q = c[3].get("quotes") or {}
-            b, a = float(q.get("best_bid") or 0), float(q.get("best_ask") or 0)
-            return (100.0 * (a - b) / c[2]) if (b > 0 and a > 0 and c[2] > 0) else 999.0
-        pool.sort(key=_spread_of)
-        _, strike, mark, tick = pool[0]
-        iv = float(tick.get("mark_vol") or 0)
-        if iv and iv > self.max_iv:
-            log.info("SKIPPED: ATM IV %.1f%% is above the %.1f%% ceiling — option too "
-                     "expensive for a %.0f-point target.",
-                     100 * iv, 100 * self.max_iv, self.target_points)
+        # Score every strike within the search span, keep the best.
+        scored = []
+        for _, k, mark, t in cands:
+            if abs(k - spot) > self.strike_span_points:
+                continue
+            sc = self._score_strike(t, k, mark, spot, hours_left, want_call, stake)
+            if sc is not None:
+                scored.append((sc["pnl"], k, mark, t, sc))
+        if not scored:
+            log.warning("No %s strike on %s could be priced with a $%.2f stake "
+                        "(all too wide, too expensive, or unquoted).",
+                        "call" if want_call else "put", tag, stake)
+            return None
+        scored.sort(key=lambda z: -z[0])
+        pnl, strike, mark, tick, sc = scored[0]
+
+        # Optional absolute ceiling. Off by default now — an over-priced contract
+        # already scores badly, so this is a belt-and-braces switch, not the filter.
+        if self.max_iv and sc["iv"] > self.max_iv:
+            log.info("SKIPPED: best strike %.0f has IV %.1f%%, above the %.1f%% "
+                     "ceiling.", strike, 100 * sc["iv"], 100 * self.max_iv)
+            return None
+        if pnl <= 0:
+            log.info("SKIPPED: best strike %.0f only scores $%+.2f on a %.0f-point "
+                     "move — nothing on the board pays for this signal.",
+                     strike, pnl, self.target_points)
             return None
 
-        quotes = tick.get("quotes") or {}
-        ask = float(quotes.get("best_ask") or 0) or mark
-        bid = float(quotes.get("best_bid") or 0) or mark
-        spread_pct = (100 * (ask - bid) / mark) if mark else 0.0
-        return dict(symbol=tick["symbol"], strike=strike, mark=mark, ask=ask, bid=bid,
-                    iv=iv, spot=spot, spread_pct=spread_pct, hours_left=hours_left,
+        runner = scored[1] if len(scored) > 1 else None
+        log.info("STRIKE %.0f (%+.0f from spot) scores $%+.2f on %.0f pts "
+                 "[%d lots @ %.1f | IV %.1f%% | spread %.1f%%]%s",
+                 strike, strike - spot, pnl, self.target_points, sc["lots"],
+                 sc["ask"], 100 * sc["iv"], sc["spread_pct"],
+                 f" | next best {runner[1]:.0f} ${runner[0]:+.2f}" if runner else "")
+
+        return dict(symbol=tick["symbol"], strike=strike, mark=mark,
+                    ask=sc["ask"], bid=sc["bid"], iv=sc["iv"], spot=spot,
+                    spread_pct=sc["spread_pct"], hours_left=hours_left,
+                    score=pnl, scored_lots=sc["lots"], considered=len(scored),
                     delta=float((tick.get("greeks") or {}).get("delta") or 0))
 
     # ------------------------------------------------------------------ #
-    def _enter(self, sig, pick: dict) -> None:
-        balance = self._balance()
+    def _score_strike(self, tick: dict, strike: float, mark: float, spot: float,
+                      hours_left: float, want_call: bool,
+                      stake: float) -> Optional[dict]:
+        """What `stake` returns on this contract if BTC moves target_points.
+
+        Buys at the ask, reprices at the moved spot after `score_hold_hours`, then
+        sells back across half the quoted spread. Returns None if the contract is
+        unquotable, too wide, or too dear to buy a single lot.
+        """
+        q = tick.get("quotes") or {}
+        ask = float(q.get("best_ask") or 0) or mark
+        bid = float(q.get("best_bid") or 0) or mark
+        iv = float(tick.get("mark_vol") or 0)
+        if ask <= 0 or iv <= 0 or mark <= 0:
+            return None
+        spread_pct = (100.0 * (ask - bid) / mark) if bid > 0 else 999.0
+        if spread_pct > self.max_spread_pct:
+            return None
+        lots = int(stake / (ask * 0.001))
+        if lots < 1:
+            return None
+        cost = lots * ask * 0.001
+        hold = min(self.score_hold_hours, max(hours_left - 0.5, 0.1))
+        t1 = max((hours_left - hold) / 24.0 / 365.0, 1e-9)
+        s1 = spot + (self.target_points if want_call else -self.target_points)
+        fair = self._bs(s1, strike, t1, iv, want_call)
+        edge = (ask - bid) / 2.0 if bid > 0 else fair * 0.06
+        proceeds = lots * max(fair - edge, 0.0) * 0.001
+        return dict(pnl=proceeds - cost, lots=lots, cost=cost, ask=ask, bid=bid,
+                    iv=iv, spread_pct=spread_pct)
+
+    @staticmethod
+    def _bs(s: float, k: float, t: float, sigma: float, call: bool) -> float:
+        """Black-Scholes at a zero rate. Only ever used to RANK strikes against
+        each other, never to decide a fair price to trade at."""
+        if t <= 1e-9 or sigma <= 1e-9:
+            return max(0.0, (s - k) if call else (k - s))
+        v = sigma * math.sqrt(t)
+        d1 = (math.log(s / k) + 0.5 * sigma * sigma * t) / v
+        d2 = d1 - v
+        cdf = lambda x: 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+        return (s * cdf(d1) - k * cdf(d2)) if call else (k * cdf(-d2) - s * cdf(-d1))
+
+    # ------------------------------------------------------------------ #
+    def _enter(self, sig, pick: dict, balance: Optional[float] = None) -> None:
+        balance = self._balance() if balance is None else balance
         stake = balance * self.stake_pct
         # pay the ask when buying at market; premium is quoted per 1 BTC
         prem_per_lot = pick["ask"] * 0.001
@@ -362,14 +444,18 @@ class OptionsTrader:
         spot = pick["spot"]
         target = spot + (self.target_points if sig.side == "long" else -self.target_points)
 
-        # what the premium is worth if BTC reaches the target now (delta approximation,
-        # ignoring the theta that will be paid getting there) — for the log only
-        est_gain = abs(pick["delta"]) * self.target_points * 0.001 * lots
+        # The strike scorer already priced this move properly — repriced at the
+        # target after the average hold, net of the spread crossed both ways. Scale
+        # it if rounding gave a different lot count than the scorer assumed.
+        # .get, not [] — this feeds a LOG LINE only, and a missing key must never
+        # be able to abort a real entry.
+        est_gain = pick.get("score", 0.0) * (lots / max(pick.get("scored_lots") or lots, 1))
 
         msg = (f"{'BUY CALL' if sig.side == 'long' else 'BUY PUT'} {pick['symbol']} "
-               f"x{lots} lots | premium {pick['ask']:.1f}/BTC = ${cost:.2f} "
-               f"({100*cost/balance:.1f}% of ${balance:.2f}) | BTC {spot:.1f} -> "
-               f"target {target:.1f} | IV {100*pick['iv']:.1f}% delta {pick['delta']:.2f} "
+               f"x{lots} lots | strike {pick['strike']:,.0f} ({pick['strike']-spot:+,.0f}) "
+               f"best of {pick.get('considered', 1)} | premium {pick['ask']:.1f}/BTC = "
+               f"${cost:.2f} ({100*cost/balance:.1f}% of ${balance:.2f}) | BTC {spot:.1f} "
+               f"-> target {target:.1f} | IV {100*pick['iv']:.1f}% delta {pick['delta']:.2f} "
                f"spread {pick['spread_pct']:.1f}% | {pick['hours_left']:.1f}h to expiry | "
                f"est +${est_gain:.2f} at target")
 
@@ -395,40 +481,74 @@ class OptionsTrader:
             log.error("Could not resolve product for %s: %s", pick["symbol"], exc)
             return
 
-        # Same-day option books can be 12-30% wide. Market-buying that would hand
-        # away most of the edge (the backtest assumed a 2.6% cost), so the entry is
-        # a LIMIT at mid + a small nudge, cancelled if it does not fill.
-        # Cross `entry_cross_pct` of the way from MID toward the ask — not
-        # mid x (1 + pct), which for any realistic spread lands above the ask and
-        # silently degenerates into paying the full offer.
-        mid = 0.5 * (pick["bid"] + pick["ask"])
-        limit_px = mid + self.entry_cross_pct * (pick["ask"] - mid)
-        limit_px = min(limit_px, pick["ask"])          # never bid above the ask
-        tick = float(prod.get("tick_size") or 0.1)
-        limit_px = round(round(limit_px / tick) * tick, 8)
-        log.info("       limit buy @ %.2f (bid %.1f / mid %.1f / ask %.1f), "
-                 "waiting up to %ds for a fill",
-                 limit_px, pick["bid"], mid, pick["ask"], self.entry_fill_seconds)
-        try:
-            resp = self.client.place_order(
-                product_id=pid, size=lots, side="buy",
-                order_type="limit_order", limit_price=limit_px,
-            )
-            log.info("Order response: %s", resp)
-        except Exception as exc:
-            log.error("ENTRY FAILED for %s: %s", pick["symbol"], exc)
-            return
-
-        if not self._await_fill(pid, pick["symbol"]):
-            log.warning("Limit not filled in %ds — cancelling and skipping this signal.",
-                        self.entry_fill_seconds)
+        # MARKET by default. The limit entry below was designed for a 12-30% wide
+        # book, where crossing to the offer is expensive enough to be worth risking
+        # a miss. Measured on the live chain the books are 1-2% wide, which inverts
+        # the trade-off: at a 1.33% spread the limit has to fill 89% of the time to
+        # break even, and 99.3% on the IV-18% numbers. A missed limit is not a
+        # cheaper trade, it is NO trade, and one trade is worth far more than half a
+        # spread. Book depth checked live: ~5,000 lots at the best offer against an
+        # order of ~66, so a market order fills at the quote without walking up.
+        # Set entry_order_type: limit to go back to waiting — worth it if spreads
+        # ever widen back out.
+        if self.entry_order_type == "market":
+            log.info("       market buy %d lots (bid %.1f / ask %.1f, spread %.2f%%)",
+                     lots, pick["bid"], pick["ask"], pick["spread_pct"])
             try:
-                self.client.cancel_all(pid)
+                resp = self.client.place_order(
+                    product_id=pid, size=lots, side="buy", order_type="market_order",
+                )
+                log.info("Order response: %s", resp)
             except Exception as exc:
-                log.error("CANCEL FAILED for %s: %s — check the exchange manually.",
-                          pick["symbol"], exc)
-            return
-        pick = {**pick, "ask": limit_px}               # record the real fill reference
+                log.error("ENTRY FAILED for %s: %s", pick["symbol"], exc)
+                return
+            # A market order should be instant, but never assume — if the position
+            # did not appear, do NOT record a trade that does not exist.
+            filled = self._await_fill(pid, pick["symbol"])
+            if filled is None:
+                log.error("Market buy for %s did not show a position — check the "
+                          "exchange manually before restarting.", pick["symbol"])
+                return
+            # Prefer the exchange's own average entry over the quote we scored on.
+            fill_ref = filled if filled > 0 else pick["ask"]
+            if filled > 0 and abs(filled - pick["ask"]) > 0.01 * max(pick["ask"], 1):
+                log.warning("       filled at %.2f, quote was %.2f (%.1f%% slip)",
+                            filled, pick["ask"],
+                            100 * (filled / pick["ask"] - 1) if pick["ask"] else 0.0)
+        else:
+            # Cross `entry_cross_pct` of the way from MID toward the ask — not
+            # mid x (1 + pct), which for any realistic spread lands above the ask
+            # and silently degenerates into paying the full offer.
+            mid = 0.5 * (pick["bid"] + pick["ask"])
+            limit_px = mid + self.entry_cross_pct * (pick["ask"] - mid)
+            limit_px = min(limit_px, pick["ask"])      # never bid above the ask
+            tick = float(prod.get("tick_size") or 0.1)
+            limit_px = round(round(limit_px / tick) * tick, 8)
+            log.info("       limit buy @ %.2f (bid %.1f / mid %.1f / ask %.1f), "
+                     "waiting up to %ds for a fill",
+                     limit_px, pick["bid"], mid, pick["ask"], self.entry_fill_seconds)
+            try:
+                resp = self.client.place_order(
+                    product_id=pid, size=lots, side="buy",
+                    order_type="limit_order", limit_price=limit_px,
+                )
+                log.info("Order response: %s", resp)
+            except Exception as exc:
+                log.error("ENTRY FAILED for %s: %s", pick["symbol"], exc)
+                return
+
+            filled = self._await_fill(pid, pick["symbol"])
+            if filled is None:
+                log.warning("Limit not filled in %ds — cancelling and skipping this "
+                            "signal.", self.entry_fill_seconds)
+                try:
+                    self.client.cancel_all(pid)
+                except Exception as exc:
+                    log.error("CANCEL FAILED for %s: %s — check the exchange manually.",
+                              pick["symbol"], exc)
+                return
+            fill_ref = filled if filled > 0 else limit_px
+        pick = {**pick, "ask": fill_ref}               # record the real fill reference
 
         self.open_trade = OpenTrade(
             symbol=pick["symbol"], product_id=int(prod["id"]), side=sig.side, lots=lots,
@@ -500,19 +620,35 @@ class OptionsTrader:
             log.warning("Could not fetch balance (%s); using config value.", exc)
         return float(self.cfg.starting_balance)
 
-    def _await_fill(self, product_id: int, symbol: str) -> bool:
-        """Poll positions until the option shows up, or the window expires."""
+    def _await_fill(self, product_id: int, symbol: str) -> Optional[float]:
+        """Poll positions until the option shows up, or the window expires.
+
+        Returns the ACTUAL average entry price the exchange recorded; 0.0 if it
+        filled but the price could not be read; None if it never filled.
+
+        Reading the real price matters now that entries cross the spread: a market
+        order fills at whatever the book gave, not at the ask quoted when the strike
+        was scored. Recording the stale quote would write a wrong entry into the
+        state file, and every P&L the bot logs — and every Telegram figure — is
+        measured against that number.
+        """
         deadline = time.time() + self.entry_fill_seconds
         while time.time() < deadline:
             time.sleep(3)
             try:
                 for p in self.client.get_option_positions():
-                    if str(p.get("product_symbol")) == symbol and                             abs(int(float(p.get("size") or 0))) > 0:
-                        log.info("       filled: size %s", p.get("size"))
-                        return True
+                    if str(p.get("product_symbol")) == symbol and \
+                            abs(int(float(p.get("size") or 0))) > 0:
+                        try:
+                            px = float(p.get("entry_price") or 0)
+                        except (TypeError, ValueError):
+                            px = 0.0
+                        log.info("       filled: size %s @ %s", p.get("size"),
+                                 f"{px:.2f}" if px > 0 else "price unavailable")
+                        return px
             except Exception as exc:
                 log.warning("fill check failed (%s), retrying.", exc)
-        return False
+        return None
 
     @staticmethod
     def _hours_to_settlement() -> float:

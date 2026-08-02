@@ -91,26 +91,36 @@ def main() -> None:
               f"= {len(live_sigs)/max(span_days,1)*30.44:.1f}/month "
               f"({lo} long / {len(live_sigs)-lo} short)")
         print(f"       most recent: {live_sigs[-1][0]}  {live_sigs[-1][1]}")
-        # RAW signals are ~8x the tradeable rate; the 12h cooldown is what gets it
-        # back to the ~41/month the backtest measured. Simulate that here.
+        # RAW signals are ~4.5x the tradeable rate. With the cooldown removed the
+        # ~6.4h average hold is the limiter — only one position runs at a time, so a
+        # signal that fires while a trade is open is discarded. Simulate BOTH gates
+        # and check the result lands near the 74/month the backtest measured.
         cd = pd.Timedelta(hours=trader.cooldown_hours)
-        taken, last_t = 0, None
+        hold = pd.Timedelta(hours=6.4)          # measured average, no cooldown
+        taken, free_at, last_t = 0, None, None
         for ts_, _sd in live_sigs:
-            if last_t is None or (ts_ - last_t) >= cd:
-                taken += 1
-                last_t = ts_
+            if free_at is not None and ts_ < free_at:
+                continue                        # a position is still open
+            if last_t is not None and (ts_ - last_t) < cd:
+                continue                        # cooling down (no-op at 0h)
+            taken += 1
+            last_t = ts_
+            free_at = ts_ + hold
         rate = taken / max(span_days, 1) * 30.44
-        check("cooldown brings the trade rate near the backtest (~41/mo)",
-              25 <= rate <= 70, f"{taken} entries = {rate:.0f}/month after the "
-              f"{trader.cooldown_hours:.0f}h cooldown (raw was "
-              f"{len(live_sigs)/max(span_days,1)*30.44:.0f}/mo)")
+        lo_, hi_ = (25, 70) if trader.cooldown_hours >= 6 else (45, 110)
+        check(f"trade rate matches the backtest for a "
+              f"{trader.cooldown_hours:.0f}h cooldown",
+              lo_ <= rate <= hi_,
+              f"{taken} entries = {rate:.0f}/month (expect {lo_}-{hi_}); raw signal "
+              f"rate was {len(live_sigs)/max(span_days,1)*30.44:.0f}/mo")
 
     # ---------------------------------------------------------------- 2
     print("\n2. OPTION SELECTION (live chain)")
     hrs = trader._hours_to_settlement()
     print(f"       {hrs:.2f}h to the 12:00 UTC settlement")
+    stake = trader.cfg.starting_balance * trader.stake_pct
     for side in ("long", "short"):
-        pick = trader._pick_option(side, hrs)
+        pick = trader._pick_option(side, hrs, stake)
         if pick is None:
             check(f"{side}: option picked", False, "none returned (may be an IV/expiry skip)")
             continue
@@ -123,19 +133,27 @@ def main() -> None:
             tgt += timedelta(days=1)
         ok_type = sym.startswith("C-") == want_c
         ok_exp = exp_tag == tgt.strftime("%d%m%y")
-        ok_atm = abs(pick["strike"] - pick["spot"]) <= 400
+        # The scorer deliberately buys slightly OTM — the cheaper contract buys
+        # enough extra lots to beat ATM on a full target move. What must NOT happen
+        # is a far-OTM lottery ticket, which scores negative and is rejected.
+        off = pick["strike"] - pick["spot"]
+        want_otm = off > 0 if want_c else off < 0
         check(f"{side}: {'CALL' if want_c else 'PUT'} selected", ok_type, sym)
         check(f"{side}: today's expiry", ok_exp, f"{exp_tag} vs {tgt:%d%m%y}")
-        check(f"{side}: strike is ATM", ok_atm,
+        check(f"{side}: strike is near the money", abs(off) <= 1500,
               f"strike {pick['strike']:,.0f} vs spot {pick['spot']:,.0f} "
-              f"(diff {abs(pick['strike']-pick['spot']):,.0f})")
+              f"({off:+,.0f}, {'OTM' if want_otm else 'ITM'})")
+        check(f"{side}: scored positive on a {trader.target_points:.0f}-pt move",
+              pick.get("score", 0) > 0,
+              f"${pick.get('score', 0):+.2f} from {pick.get('considered', 0)} strikes")
         print(f"       premium {pick['ask']:.1f}/BTC | IV {100*pick['iv']:.1f}% | "
               f"delta {pick['delta']:.2f} | spread {pick['spread_pct']:.1f}%")
 
     # ---------------------------------------------------------------- 3
     print("\n3. SIZING (10% of wallet)")
     bal = trader._balance()
-    pick = trader._pick_option("long", hrs) or trader._pick_option("short", hrs)
+    pick = (trader._pick_option("long", hrs, stake)
+            or trader._pick_option("short", hrs, stake))
     if pick:
         stake = bal * trader.stake_pct
         per_lot = pick["ask"] * 0.001
@@ -223,10 +241,23 @@ def main() -> None:
     print(f"  [INFO] config mode: {mode}")
     check("live still requires the --live flag as a second gate", True,
           "dry_run alone cannot place an order")
-    check("max_iv gate configured", trader.max_iv > 0, f"skip if IV > {100*trader.max_iv:.0f}%")
+    # max_iv is optional by design: the strike scorer rejects an over-priced
+    # contract by pricing what it would return, so the absolute ceiling is a
+    # belt-and-braces switch. Either state is valid — assert it is deliberate.
+    check("max_iv setting is coherent", trader.max_iv >= 0,
+          f"ceiling at {100*trader.max_iv:.0f}%" if trader.max_iv
+          else "OFF — the strike scorer is the price filter")
     check("min hours-to-expiry gate", trader.min_hours_to_expiry >= 1,
           f"skip if <{trader.min_hours_to_expiry:.0f}h left")
-    check("cooldown configured", trader.cooldown_hours > 0, f"{trader.cooldown_hours:.0f}h")
+    # Cooldown removed on purpose. With it off, max_trades_per_day is the ONLY
+    # rate limit left, so that is what has to be sane.
+    check("a rate limit exists", trader.cooldown_hours > 0
+          or 1 <= cfg.risk.max_trades_per_day <= 24,
+          f"cooldown {trader.cooldown_hours:.0f}h + cap "
+          f"{cfg.risk.max_trades_per_day}/day")
+    check("daily cap covers the busiest observed day",
+          trader.cooldown_hours > 0 or cfg.risk.max_trades_per_day >= 9,
+          f"cap {cfg.risk.max_trades_per_day} vs 9 signals on the busiest day")
     check("stake is a PERCENTAGE not a fixed $", 0 < trader.stake_pct < 1,
           f"{100*trader.stake_pct:.0f}% of wallet")
 

@@ -75,7 +75,9 @@ def main() -> None:
     extra: list[str] = []
     if args.live:
         print("\n*** LIVE — BTC OPTIONS (options_dip) + dashboard ***")
-        print("  target +400 BTC pts | 10% of wallet per trade | today's expiry, ATM")
+        print("  target +400 BTC pts | 10% of wallet per trade | today's expiry")
+        print("  strike: every one within +/-3000 is scored on what it would return")
+        print("  on a 400-pt move; the best is bought. No cooldown, no IV ceiling.")
         print("  no stop-loss — the option premium is the maximum loss")
         print(f"  {CONFIG.name} must also have live.dry_run: false")
         if input("\nType 'I UNDERSTAND' to trade real money: ").strip() != "I UNDERSTAND":

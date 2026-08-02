@@ -104,7 +104,8 @@ def contract_size(sym: str) -> float:
 
 @st.cache_data(ttl=25)
 def fetch(_client: DeltaClient, have_keys: bool) -> dict:
-    out = {"balance": None, "positions": [], "fills": [], "prices": {}, "err": None}
+    out = {"balance": None, "positions": [], "fills": [], "prices": {},
+           "quotes": {}, "err": None}
     try:
         for sym in ("BTCUSD", "ETHUSD"):
             try:
@@ -120,51 +121,81 @@ def fetch(_client: DeltaClient, have_keys: bool) -> dict:
             out["balance"] = usd or None
             out["positions"] = _client.get_positions() or []
             out["fills"] = _client.get_fills(200) or []
+            # Delta's position.unrealized_pnl is WRONG for options (returns -3.18
+            # on a position actually down -11.45), so quote each open symbol and
+            # compute it ourselves from the bid — what you would really receive.
+            for p in out["positions"]:
+                sym = str(p.get("product_symbol") or "")
+                if not sym or int(float(p.get("size") or 0)) == 0:
+                    continue
+                try:
+                    t = _client.get_ticker(sym)
+                    q = t.get("quotes") or {}
+                    out["quotes"][sym] = {
+                        "mark": float(t.get("mark_price") or 0),
+                        "bid": float(q.get("best_bid") or 0),
+                        "ask": float(q.get("best_ask") or 0),
+                    }
+                except Exception:
+                    pass
     except Exception as exc:
         out["err"] = str(exc)
     return out
 
 
 def realised_trades(fills: list[dict]) -> list[dict]:
-    """FIFO-match fills per symbol into CLOSED round trips with computed P&L."""
+    """Group fills into ROUND TRIPS — one row per position, not per fill.
+
+    A single order is often filled in pieces (a 74-lot exit came back as
+    20 + 1 + 29 + 24). Matching fill-against-fill would report that as four
+    separate trades and quarter the average trade size, so instead each symbol is
+    tracked as a POSITION EPISODE: it opens when size leaves zero and closes when
+    size returns to zero, and the whole episode is one trade. Entry/exit prices
+    are size-weighted averages across every partial fill.
+    """
     chrono = sorted(fills, key=lambda f: str(f.get("created_at") or ""))
-    books: dict[str, deque] = defaultdict(deque)
+    live: dict[str, dict] = {}
     trades = []
     for f in chrono:
         sym = f.get("product_symbol") or ""
         if not sym:
             continue
         try:
-            size = abs(float(f.get("size") or 0))
+            qty = abs(float(f.get("size") or 0))
             px = float(f.get("price") or 0)
             comm = float(f.get("commission") or 0)
         except Exception:
             continue
-        if size <= 0 or px <= 0:
+        if qty <= 0 or px <= 0:
             continue
         sign = 1 if str(f.get("side", "")).lower() == "buy" else -1
         cs = contract_size(sym)
-        book = books[sym]
-        comm_pu = comm / size if size else 0.0
 
-        while size > 0 and book and book[0]["sign"] != sign:
-            lot = book[0]
-            qty = min(size, lot["size"])
-            direction = lot["sign"]
-            gross = (px - lot["px"]) * qty * cs * direction
-            fees = qty * (lot["comm"] + comm_pu)
+        ep = live.get(sym)
+        if ep is None:
+            ep = live[sym] = dict(pos=0.0, dir=sign, in_qty=0.0, in_val=0.0,
+                                  out_qty=0.0, out_val=0.0, fees=0.0,
+                                  opened=f.get("created_at"))
+        ep["fees"] += comm
+        if sign == ep["dir"]:                       # adding to the position
+            ep["in_qty"] += qty
+            ep["in_val"] += qty * px
+        else:                                       # reducing / closing
+            ep["out_qty"] += qty
+            ep["out_val"] += qty * px
+        ep["pos"] += sign * qty
+
+        if abs(ep["pos"]) < 1e-9 and ep["out_qty"] > 0:   # flat -> book one trade
+            entry = ep["in_val"] / ep["in_qty"] if ep["in_qty"] else 0.0
+            exitp = ep["out_val"] / ep["out_qty"] if ep["out_qty"] else 0.0
+            gross = (exitp - entry) * ep["out_qty"] * cs * ep["dir"]
             trades.append({
-                "symbol": sym, "opened": lot["t"], "closed": f.get("created_at"),
-                "side": "LONG" if direction > 0 else "SHORT", "size": qty,
-                "entry": lot["px"], "exit": px, "pnl": gross - fees, "fees": fees,
+                "symbol": sym, "opened": ep["opened"], "closed": f.get("created_at"),
+                "side": "LONG" if ep["dir"] > 0 else "SHORT",
+                "size": ep["out_qty"], "entry": entry, "exit": exitp,
+                "pnl": gross - ep["fees"], "fees": ep["fees"],
             })
-            lot["size"] -= qty
-            size -= qty
-            if lot["size"] <= 1e-12:
-                book.popleft()
-        if size > 0:
-            book.append({"sign": sign, "size": size, "px": px,
-                         "comm": comm_pu, "t": f.get("created_at")})
+            del live[sym]
     return trades
 
 
@@ -206,7 +237,22 @@ baseline, strat_start = load_baseline(bal)
 scoped_fills = [f for f in data["fills"] if in_scope(f, strat_start)]
 trades = realised_trades(scoped_fills)
 realised = sum(t["pnl"] for t in trades)
-ret_pct = (100.0 * realised / baseline) if (baseline and baseline > 0) else None
+
+# Open positions must count too. Reporting +0.00% while an open trade is -$12
+# is the kind of thing you only notice after trusting it.
+open_pnl = 0.0
+for _p in data["positions"]:
+    _sym = str(_p.get("product_symbol") or "")
+    _sz = int(float(_p.get("size") or 0))
+    if not _sym or _sz == 0 or not _sym.startswith(("C-BTC", "P-BTC")):
+        continue
+    _q = data["quotes"].get(_sym, {})
+    _px = _q.get("bid") or _q.get("mark") or 0.0
+    _e = float(_p.get("entry_price", 0) or 0)
+    open_pnl += abs(_sz) * (_px - _e) * contract_size(_sym) * (1 if _sz > 0 else -1)
+
+total_pnl = realised + open_pnl
+ret_pct = (100.0 * total_pnl / baseline) if (baseline and baseline > 0) else None
 try:
     start_label = dt.datetime.fromisoformat(strat_start).strftime("%d %b %Y")
 except Exception:
@@ -221,8 +267,19 @@ with top[0]:
                 f'<span style="font-size:12px">counting this strategy only, '
                 f'since <b>{start_label}</b></span></span>', unsafe_allow_html=True)
 with top[1]:
-    st.markdown('<div class="lbl">Account balance</div>', unsafe_allow_html=True)
-    st.markdown(f'<div class="kpi mono">{"$%.2f" % bal if bal is not None else "—"}</div>',
+    st.markdown('<div class="lbl">Account value</div>', unsafe_allow_html=True)
+    # cash alone understates you while a position is open: buying an option moves
+    # the premium out of cash into the position.
+    equity = (bal or 0.0) + sum(
+        abs(int(float(p.get("size") or 0)))
+        * ((data["quotes"].get(str(p.get("product_symbol")), {}).get("bid")
+            or data["quotes"].get(str(p.get("product_symbol")), {}).get("mark") or 0.0))
+        * contract_size(str(p.get("product_symbol") or ""))
+        for p in data["positions"] if int(float(p.get("size") or 0)) != 0)
+    st.markdown(f'<div class="kpi mono">{"$%.2f" % equity if bal is not None else "—"}</div>'
+                + (f'<div class="dim mono" style="font-size:11.5px">'
+                   f'cash ${bal:,.2f} + open ${equity-bal:,.2f}</div>'
+                   if bal is not None and abs(equity - bal) > 0.005 else ''),
                 unsafe_allow_html=True)
 with top[2]:
     st.markdown('<div class="lbl">Return · this strategy</div>', unsafe_allow_html=True)
@@ -233,8 +290,10 @@ with top[2]:
             f'<div class="kpi mono {"up" if ret_pct >= 0 else "down"}">'
             f'{"+" if ret_pct >= 0 else "−"}{abs(ret_pct):.2f}%</div>'
             f'<div class="dim mono" style="font-size:11.5px">'
-            f'{"+" if realised >= 0 else "−"}${abs(realised):,.2f} on ${baseline:,.2f} '
-            f'since {start_label}</div>',
+            f'{"+" if total_pnl >= 0 else "−"}${abs(total_pnl):,.2f} on ${baseline:,.2f} '
+            f'since {start_label}'
+            + (f'<br>realised {realised:+,.2f} · open {open_pnl:+,.2f}'
+               if abs(open_pnl) > 0.005 else '') + '</div>',
             unsafe_allow_html=True)
 
 if not have_keys:
@@ -283,7 +342,11 @@ def card(meta, active: bool):
         size = int(float(p.get("size") or 0))
         side = "long" if size > 0 else "short"
         entry = float(p.get("entry_price", 0) or 0)
-        upnl = float(p.get("unrealized_pnl", 0) or 0)
+        # compute it — never trust p["unrealized_pnl"] for options
+        qt = data["quotes"].get(str(p.get("product_symbol") or ""), {})
+        exitpx = qt.get("bid") or qt.get("mark") or 0.0
+        cs = contract_size(str(p.get("product_symbol") or ""))
+        upnl = abs(size) * (exitpx - entry) * cs * (1 if size > 0 else -1)
         body = (f'<span class="pill {side}">{side.upper()} {abs(size)} lots</span>'
                 f'<span class="dim mono" style="margin-left:8px">'
                 f'{p.get("product_symbol")} @ {entry:,.1f}</span>'

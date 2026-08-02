@@ -1,0 +1,89 @@
+# =====================================================================
+# BTC OPTIONS — "Trend Dip Sniper" on the Delta India option chain.
+#
+#   signal   5m BTCUSD: EMA50/200 regime + RSI(14) crossing 40 / 60
+#   trade    buy the ATM option on TODAY'S expiry (call on long, put on short)
+#   target   BTC +400 points -> sell to close at market
+#   stop     NONE. Buying an option already caps the loss at the premium, and
+#            back-testing showed an underlying stop only closed trades that
+#            would have recovered (168 of them, 0 the other way).
+#   size     10% of wallet per trade (percentage, NOT fixed — a fixed stake
+#            cannot shrink during a losing run and tested at ~20% ruin risk)
+#
+# Measured on 2y of real Delta 5m candles, same-day ATM options, 2.6% spread:
+#   ~41 trades/month | 69-70% win | +$18.43 per $50 staked (mid fills, 17.7% IV)
+#   worst real 6-month stretch at 10%: -91% drawdown, never wiped out
+#
+# DRY-RUN by default. Set live.dry_run: false AND pass --live to trade real money.
+# =====================================================================
+
+exchange:
+  region: india
+
+market:
+  symbol: BTCUSD
+  resolution: "5m"        # signal timeframe
+  trend_resolution: "1h"  # unused by this strategy
+  lot_size: 0.001         # Delta BTC option contract = 0.001 BTC
+  min_lots: 1
+
+account:
+  starting_balance: 150.0  # fallback + dry-run sizing; live reads the API balance
+
+risk:
+  # NOTE: options sizing is driven by strategy.params.stake_pct, NOT by this block.
+  # These fields exist only because the shared Config validator (used by the three
+  # perp strategies) requires them. risk_per_trade_pct is set to match stake_pct so
+  # the two can never disagree in a confusing way, but the options trader reads
+  # stake_pct.
+  capital_allocation_pct: 1.0
+  sizing_mode: risk
+  risk_per_trade_usd: null
+  risk_per_trade_pct: 0.10
+  reward_risk_ratio: 1.0
+  max_trades_per_day: 4      # cooldown_hours is the real limiter (12h -> ~2/day)
+  max_open_positions: 1
+  max_leverage: 1            # buying options is not leveraged; no liquidation
+  trail_distance_r: null
+
+strategy:
+  name: options_dip
+  params:
+    underlying: BTCUSD
+    ema_fast: 50
+    ema_slow: 200
+    rsi_len: 14
+    rsi_buy: 40.0            # cross DOWN through this in an uptrend -> buy CALL
+    rsi_sell: 60.0           # cross UP through this in a downtrend -> buy PUT
+    both_sides: true
+
+    target_points: 400.0     # BTC points; +400 was the best $/trade in testing
+    stake_pct: 0.10          # 10% of wallet per trade
+
+    min_hours_to_expiry: 3.0     # skip signals inside 3h of the 12:00 UTC settlement
+    close_before_expiry_min: 20  # flatten 20 min before settlement if target unhit
+    cooldown_hours: 12.0         # min gap between entries
+    max_iv: 0.30                 # skip if ATM IV > 30% (breakeven is ~30% for +400)
+
+    # --- execution: same-day option books are wide (puts ~2.6%, calls 12-32%) ---
+    max_spread_pct: 12.0         # skip the signal if the book is wider than this
+    entry_cross_pct: 0.15        # limit price = mid x (1 + 15% of half-spread nudge)
+    entry_fill_seconds: 45       # cancel and skip if the limit has not filled
+    strike_pool: 3               # consider the 3 strikes nearest spot, take the
+                                 # tightest book (the exact-ATM strike is often the
+                                 # widest — measured 17.9% vs 5.7% one strike away)
+
+backtest:
+  fee_rate: 0.0005
+  slippage_rate: 0.0002
+  results_dir: results
+
+live:
+  dry_run: false           # LIVE — real orders. Still gated by the --live flag and a
+                           #        typed "I UNDERSTAND" confirmation at startup.
+                           #        Set back to true to disable instantly.
+  poll_seconds: 60         # 60s poll — fine for a 5m signal and a 400-pt target
+  order_type: market_order
+
+notify:
+  enabled: true

@@ -50,7 +50,9 @@ backtest:
   results_dir: results
 
 live:
-  dry_run: false                 # LIVE — real orders (still gated by --live confirmation)
+  dry_run: true                  # DISABLED 2026-08-02 — replaced by the BTC options
+                                 # strategy (config.options_btc.yaml). Set back to
+                                 # false to re-enable this leg.
   poll_seconds: 60
   order_type: market_order
 

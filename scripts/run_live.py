@@ -46,8 +46,18 @@ def main() -> None:
             print("ERROR: DELTA_API_KEY / DELTA_API_SECRET missing in .env.")
             sys.exit(1)
         print("\n*** LIVE TRADING ***")
+        # Show the sizing that is ACTUALLY used. In margin mode risk_per_trade_usd is
+        # ignored (dollar risk = notional x stop%), so printing "$3/trade" would lie.
+        if cfg.risk.sizing_mode == "margin":
+            mult = cfg.risk.capital_allocation_pct * cfg.risk.max_leverage
+            sizing = (f"MARGIN sizing ~{mult:g}x wallet notional/trade "
+                      f"(dollar risk = notional x stop%, NOT a fixed $)")
+        elif cfg.risk.risk_per_trade_pct is not None:
+            sizing = f"risk {cfg.risk.risk_per_trade_pct:.1%} of wallet/trade"
+        else:
+            sizing = f"risk ${cfg.risk.risk_per_trade_usd:g}/trade"
         print(f"Symbol {cfg.market.symbol} @ {cfg.market.resolution} | "
-              f"risk ${cfg.risk.risk_per_trade_usd}/trade | "
+              f"{sizing} | "
               f"R:R 1:{cfg.risk.reward_risk_ratio:g} | "
               f"max {cfg.risk.max_trades_per_day} trades/day")
         if not args.yes:

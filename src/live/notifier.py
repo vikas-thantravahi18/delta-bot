@@ -6,16 +6,27 @@ what you did. To you it decodes cleanly; to everyone else it's just an anime ale
 
 DECODER KEY  (keep this private):
     Which anime  ->  which strategy fired
+        Demon Slayer     = options_dip    (BTC options — the live strategy)
         One Piece        = v2_dualtrend   (BTCUSD 1h)
         Naruto           = ema_rsi_atr    (BTCUSD 30m)
         Jujutsu Kaisen   = ut_stc         (ETHUSD 4h)
         Bleach           = any other strategy
-    "new Episode ... dropped"   = a LONG (buy) was opened
-    "new Movie announced"       = a SHORT (sell) was opened
+
+  OPENING a trade
+    "new Episode ... dropped"   = a LONG was opened   (a CALL, for options)
+    "new Movie announced"       = a SHORT was opened  (a PUT, for options)
     the Episode / Teaser number = the number of lots (position size)
+
+  CLOSING a trade   (options only — the perp legs closed via exchange brackets)
+    "finale aired ... rated X" = closed in PROFIT, X = dollars made
+    "delayed ... X episodes"   = closed at a LOSS,  X = dollars lost
+    "on hiatus"                = closed flat (inside a cent)
 
     e.g.  "Naruto - Episode 6 just dropped!"  = ema_rsi opened a 6-lot LONG on BTC
           "One Piece - new Movie announced! Teaser 3"  = v2 opened a 3-lot SHORT on BTC
+          "Demon Slayer - Episode 104 just dropped!"   = options bought 104 CALL lots
+          "Demon Slayer - finale aired ... rated 19.6" = that trade closed +$19.60
+          "Demon Slayer - delayed ... 14.2 episodes"   = that trade closed -$14.20
 
 ONE-TIME SETUP:
     1. In Telegram, message @BotFather -> /newbot -> copy the bot TOKEN.
@@ -38,6 +49,7 @@ log = logging.getLogger("live")
 
 # strategy name -> cover anime. Add your own; unknown strategies use DEFAULT_ANIME.
 ANIME = {
+    "options_dip": "Demon Slayer",
     "v2_dualtrend": "One Piece",
     "ema_rsi_atr": "Naruto",
     "ut_stc": "Jujutsu Kaisen",
@@ -46,12 +58,27 @@ DEFAULT_ANIME = "Bleach"
 
 
 def encode_trade(strategy_name: str, side: str, lots: int) -> str:
-    """Turn a trade into an innocuous 'anime release' message (see DECODER KEY)."""
+    """Turn an OPENED trade into an innocuous 'anime release' message."""
     anime = ANIME.get(strategy_name, DEFAULT_ANIME)
     n = int(lots)
     if str(side).lower() == "long":
         return f"\U0001F37F {anime} — Episode {n} just dropped! Subbed and ready to watch tonight \U0001F525"
     return f"\U0001F3AC {anime} — a new Movie was announced! Teaser {n} is out now \U0001F3A5"
+
+
+def encode_close(strategy_name: str, pnl: float, reason: str = "") -> str:
+    """Turn a CLOSED trade into the same code-speak. The number is the P&L in
+    dollars: a 'rating' when we made money, 'delayed episodes' when we lost."""
+    anime = ANIME.get(strategy_name, DEFAULT_ANIME)
+    amt = abs(float(pnl))
+    tail = " (early screening)" if "TARGET" in str(reason).upper() else ""
+    if pnl > 0.005:
+        return (f"⭐ {anime} — the finale aired{tail}! Fans are rating it "
+                f"{amt:.1f} \U0001F3AF")
+    if pnl < -0.005:
+        return (f"\U0001F4C6 {anime} — the finale got delayed, {amt:.1f} episodes "
+                f"pushed back \U0001F614")
+    return f"\U0001F4FA {anime} — the series is on hiatus for now ⏸"
 
 
 class TelegramNotifier:
@@ -89,5 +116,9 @@ class TelegramNotifier:
             return False
 
     def notify_trade(self, strategy_name: str, side: str, lots: int) -> None:
-        """Send the coded 'anime release' alert for an executed trade."""
+        """Send the coded 'anime release' alert for an OPENED trade."""
         self.send(encode_trade(strategy_name, side, lots))
+
+    def notify_close(self, strategy_name: str, pnl: float, reason: str = "") -> None:
+        """Send the coded alert for a CLOSED trade, with P&L hidden in the number."""
+        self.send(encode_close(strategy_name, pnl, reason))

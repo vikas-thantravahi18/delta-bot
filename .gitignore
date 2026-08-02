@@ -16,6 +16,16 @@ results/
 *.csv
 !tests/**/*.csv
 
+# Bot RUNTIME state — machine-specific, never version this.
+# options_state.json holds the LIVE open position; committing it would let one
+# machine's stale position overwrite another's, so the bot would try to manage a
+# trade that does not exist. dashboard_baseline.json is your own capital marker.
+data/options_state.json
+data/dashboard_baseline.json
+data/locks/
+signals.jsonl
+points_signals.jsonl
+
 # OS / editor
 .DS_Store
 .vscode/

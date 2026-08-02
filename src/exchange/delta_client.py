@@ -117,6 +117,31 @@ class DeltaClient:
         return self._request("GET", f"/v2/tickers/{symbol}")
 
     # ------------------------------------------------------------------ #
+    # Options
+    # ------------------------------------------------------------------ #
+    def get_option_tickers(self, underlying: str = "BTC") -> list[dict]:
+        """Whole live option chain for `underlying`, with mark price and greeks.
+
+        One call returns every strike and expiry, so strike/expiry selection can
+        be done locally instead of hammering per-symbol endpoints.
+        """
+        res = self._request(
+            "GET", "/v2/tickers",
+            params={"contract_types": "call_options,put_options"},
+        ) or []
+        return [t for t in res
+                if str(t.get("underlying_asset_symbol", "")).upper() == underlying.upper()]
+
+    def get_option_positions(self) -> list[dict]:
+        """Open OPTION positions only (Delta reports them under /positions/margined)."""
+        out = []
+        for p in (self.get_positions() or []):
+            sym = str(p.get("product_symbol") or "")
+            if sym.startswith(("C-", "P-")) and int(float(p.get("size") or 0)) != 0:
+                out.append(p)
+        return out
+
+    # ------------------------------------------------------------------ #
     # Account / trading (signed)
     # ------------------------------------------------------------------ #
     def get_balances(self) -> list[dict]:

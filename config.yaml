@@ -75,6 +75,9 @@ backtest:
   results_dir: results
 
 live:
-  dry_run: false
+  dry_run: true                  # DISABLED 2026-08-02 — this is the DEFAULT config
+                                 # run_live.py picks up with no --config flag, so it
+                                 # was still live-capable. Replaced by the BTC options
+                                 # strategy (config.options_btc.yaml).
   poll_seconds: 60
   order_type: market_order

@@ -58,12 +58,22 @@ class RiskManager:
         self.lot_size = lot_size      # BTC per lot/contract (Delta BTCUSD = 0.001)
         self.min_lots = max(1, int(min_lots))
 
+    def allocation(self, balance: float) -> float:
+        """Dollars deployed AS MARGIN on a trade.
+
+        `allocation_usd` is a flat figure and wins when set; otherwise it is a
+        share of the wallet. Either way it is capped at the balance — you cannot
+        post margin you do not have.
+        """
+        if self.cfg.allocation_usd is not None:
+            return min(float(self.cfg.allocation_usd), float(balance))
+        return balance * self.cfg.capital_allocation_pct
+
     def risk_amount(self, balance: float) -> float:
         """Dollar risk budget for a single trade."""
         if self.cfg.risk_per_trade_usd is not None:
             return float(self.cfg.risk_per_trade_usd)
-        allocated = balance * self.cfg.capital_allocation_pct
-        return allocated * float(self.cfg.risk_per_trade_pct)
+        return self.allocation(balance) * float(self.cfg.risk_per_trade_pct)
 
     def liquidation_buffer_ok(self, entry: float, stop: float) -> bool:
         """Guard against the exchange's isolated-margin liquidation firing
@@ -92,8 +102,9 @@ class RiskManager:
         rr = self.cfg.reward_risk_ratio
         take_profit = entry + rr * stop_distance if side == "long" else entry - rr * stop_distance
 
-        # Allocation = the share of wallet we're willing to deploy as margin.
-        allocated = balance * self.cfg.capital_allocation_pct
+        # Allocation = what we deploy as margin: a flat allocation_usd if set,
+        # otherwise a share of the wallet.
+        allocated = self.allocation(balance)
         risk_budget = self.risk_amount(balance)
 
         # Two ways to size, both in base units (BTC/ETH):

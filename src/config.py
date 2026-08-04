@@ -47,6 +47,11 @@ class RiskConfig:
     #                        every trade (big, fixed-NOTIONAL). The dollar RISK then
     #                        scales with the stop distance and can be large.
     sizing_mode: str = "risk"
+    # Fixed dollar allocation, overriding capital_allocation_pct when set. A
+    # percentage of the wallet grows with the account; a flat figure does not.
+    # Use this when "$20 per trade" should mean exactly $20 whatever the balance.
+    # It is deployed AS MARGIN, so notional = allocation_usd x max_leverage.
+    allocation_usd: Optional[float] = None
     reward_risk_ratio: float = 2.0
     max_trades_per_day: int = 2
     max_open_positions: int = 1
@@ -132,6 +137,7 @@ class Config:
             risk_per_trade_usd=_opt_float(r.get("risk_per_trade_usd", 5.0)),
             risk_per_trade_pct=_opt_float(r.get("risk_per_trade_pct", None)),
             sizing_mode=str(r.get("sizing_mode", "risk")).lower(),
+            allocation_usd=_opt_float(r.get("allocation_usd", None)),
             reward_risk_ratio=float(r.get("reward_risk_ratio", 2.0)),
             max_trades_per_day=int(r.get("max_trades_per_day", 2)),
             max_open_positions=int(r.get("max_open_positions", 1)),

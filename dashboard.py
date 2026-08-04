@@ -48,18 +48,38 @@ BASELINE_PATH = ROOT / "data" / "dashboard_baseline.json"
 BTC_CONTRACT = 0.001          # Delta BTC perp AND BTC option contract size
 ETH_CONTRACT = 0.01
 
-ACTIVE = {
-    "name": "options_dip",
-    "market": "BTC options · 5m signal · +400 pts · 10% stake",
-    "tok": "◆", "color": "#f7931a",
-    "match": lambda s: s.startswith(("C-BTC", "P-BTC")),
-}
+# Both option legs are tracked. BTC and ETH have different contract sizes,
+# different strategies and different targets, so they get separate scorecards —
+# a blended number would hide which one is actually working.
+# Options legs get per-asset scorecards below; the perp legs share the BTC slot
+# via market_lock so they are shown as one card.
+ACTIVE = [
+    {"name": "ut_stc", "asset": "ETH",
+     "market": "ETH options · 4h · +30 pts · 10% stake",
+     "tok": "Ξ", "color": "#6f7ce8",
+     "match": lambda s: s.startswith(("C-ETH", "P-ETH"))},
+    {"name": "v2 + ema_rsi", "asset": "BTC-perp",
+     "market": "BTCUSD perp · 1h + 30m · margin 50% @ 10x",
+     "tok": "₿", "color": "#f7931a",
+     "match": lambda s: s == "BTCUSD"},
+]
 DISABLED = [
-    {"name": "v2 + ema_rsi", "market": "BTCUSD · 1h + 30m", "tok": "₿",
-     "color": "#3d4759", "match": lambda s: s == "BTCUSD"},
-    {"name": "ut_stc", "market": "ETHUSD · 4h", "tok": "Ξ",
+    {"name": "options_dip", "market": "BTC options · 5m — disabled 04 Aug",
+     "tok": "◆", "color": "#3d4759",
+     "match": lambda s: s.startswith(("C-BTC", "P-BTC"))},
+    {"name": "ut_stc (perp)", "market": "ETHUSD perp · 4h", "tok": "Ξ",
      "color": "#3d4759", "match": lambda s: s == "ETHUSD"},
 ]
+
+
+def asset_of(sym: str) -> str:
+    """Which option book a fill belongs to. '' for perps and anything else."""
+    s = str(sym or "")
+    if s.startswith(("C-BTC", "P-BTC")):
+        return "BTC"
+    if s.startswith(("C-ETH", "P-ETH")):
+        return "ETH"
+    return ""
 
 st.set_page_config(page_title="Delta Bot Monitor", page_icon="📊", layout="wide")
 
@@ -220,12 +240,15 @@ def load_baseline(balance):
 
 
 def in_scope(f, start_iso: str) -> bool:
-    """Only this strategy's trades: option instruments, on/after the start."""
+    """Fills from any ENABLED leg, on/after the baseline.
+
+    Both option books and the BTC perp count now that v2/ema_rsi are live again.
+    Anything else on the account is somebody else's trade and is excluded.
+    """
     sym = str(f.get("product_symbol") or "")
-    if not sym.startswith(("C-BTC", "P-BTC")):
+    if not (asset_of(sym) or sym in ("BTCUSD", "ETHUSD")):
         return False
-    ts = str(f.get("created_at") or "")
-    return ts >= start_iso
+    return str(f.get("created_at") or "") >= start_iso
 
 
 client, cfg = get_client()
@@ -241,15 +264,19 @@ realised = sum(t["pnl"] for t in trades)
 # Open positions must count too. Reporting +0.00% while an open trade is -$12
 # is the kind of thing you only notice after trusting it.
 open_pnl = 0.0
+open_by_asset = {"BTC": 0.0, "ETH": 0.0, "BTC-perp": 0.0, "ETH-perp": 0.0}
 for _p in data["positions"]:
     _sym = str(_p.get("product_symbol") or "")
     _sz = int(float(_p.get("size") or 0))
-    if not _sym or _sz == 0 or not _sym.startswith(("C-BTC", "P-BTC")):
+    _a = asset_of(_sym) or (f"{_sym[:3]}-perp" if _sym in ("BTCUSD", "ETHUSD") else "")
+    if not _a or _sz == 0:
         continue
     _q = data["quotes"].get(_sym, {})
     _px = _q.get("bid") or _q.get("mark") or 0.0
     _e = float(_p.get("entry_price", 0) or 0)
-    open_pnl += abs(_sz) * (_px - _e) * contract_size(_sym) * (1 if _sz > 0 else -1)
+    _u = abs(_sz) * (_px - _e) * contract_size(_sym) * (1 if _sz > 0 else -1)
+    open_by_asset[_a] += _u
+    open_pnl += _u
 
 total_pnl = realised + open_pnl
 ret_pct = (100.0 * total_pnl / baseline) if (baseline and baseline > 0) else None
@@ -262,9 +289,9 @@ except Exception:
 top = st.columns([2.4, 1, 1])
 with top[0]:
     st.markdown("## Delta Bot Monitor")
-    st.markdown(f'<span class="dim">options_dip · BTC options — <b>ACTIVE</b> '
-                f'&nbsp;·&nbsp; perp legs disabled<br>'
-                f'<span style="font-size:12px">counting this strategy only, '
+    st.markdown(f'<span class="dim">options_dip · BTC &nbsp;+&nbsp; ut_stc · ETH '
+                f'— <b>ACTIVE</b> &nbsp;·&nbsp; perp legs disabled<br>'
+                f'<span style="font-size:12px">counting option trades only, '
                 f'since <b>{start_label}</b></span></span>', unsafe_allow_html=True)
 with top[1]:
     st.markdown('<div class="lbl">Account value</div>', unsafe_allow_html=True)
@@ -303,8 +330,8 @@ if data["err"]:
     st.warning(f"Delta API: {data['err']}")
 
 st.caption(f"Updated {dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} · cached 25s · "
-           f"press R or the button to refresh · scope: options_dip since {start_label} "
-           f"({len(scoped_fills)} fills counted, older/perp trades excluded)")
+           f"press R or the button to refresh · scope: BTC + ETH options since "
+           f"{start_label} ({len(scoped_fills)} fills counted, perp trades excluded)")
 if st.button("↻ Refresh now"):
     st.cache_data.clear()
     st.rerun()
@@ -329,6 +356,60 @@ if trades:
             st.markdown(f'<div class="statbox"><div class="lbl">{lbl}</div>'
                         f'<div class="kpi sm mono {cls}">{val}</div></div>',
                         unsafe_allow_html=True)
+
+# ---------- per-asset breakdown ----------
+# BTC and ETH run different strategies on different contracts. A combined number
+# tells you the account is up or down; it does not tell you which leg did it.
+st.markdown("")
+st.markdown("#### By asset")
+_acols = st.columns(2)
+for _c, _meta in zip(_acols, ACTIVE):
+    _a = _meta["asset"]
+    # Use each leg's own match(), so an options leg and a perp leg are both
+    # attributed correctly rather than assuming everything is an option.
+    _tr = [t for t in trades if _meta["match"](str(t.get("symbol") or ""))]
+    _real = sum(t["pnl"] for t in _tr)
+    _open = 0.0
+    for _p in data["positions"]:
+        _s = str(_p.get("product_symbol") or "")
+        _z = int(float(_p.get("size") or 0))
+        if _z == 0 or not _meta["match"](_s):
+            continue
+        _q2 = data["quotes"].get(_s, {})
+        _x = _q2.get("bid") or _q2.get("mark") or 0.0
+        _e2 = float(_p.get("entry_price", 0) or 0)
+        _open += abs(_z) * (_x - _e2) * contract_size(_s) * (1 if _z > 0 else -1)
+    _tot = _real + _open
+    _wins = [t for t in _tr if t["pnl"] > 0]
+    _wr = f"{100*len(_wins)/len(_tr):.0f}%" if _tr else "—"
+    _avg = f"${_real/len(_tr):+,.2f}" if _tr else "—"
+    _ret = f"{100*_tot/baseline:+.2f}%" if (baseline and baseline > 0) else "—"
+    _cls = "up" if _tot >= 0 else "down"
+    with _c:
+        st.markdown(
+            f'<div class="card" style="--sc:{_meta["color"]}">'
+            f'<div style="display:flex;align-items:center;gap:9px;margin-bottom:12px">'
+            f'<span class="tok" style="background:{_meta["color"]}">{_meta["tok"]}</span>'
+            f'<div><div style="font-weight:640;font-size:15px">{_a} options'
+            f' <span class="dim" style="font-weight:400">· {_meta["name"]}</span></div>'
+            f'<div class="dim mono" style="font-size:11.5px">{_meta["market"]}</div>'
+            f'</div></div>'
+            f'<div style="display:flex;gap:22px;flex-wrap:wrap">'
+            f'<div><div class="lbl">Total P&amp;L</div>'
+            f'<div class="kpi sm mono {_cls}">{"+" if _tot>=0 else "−"}'
+            f'${abs(_tot):,.2f}</div></div>'
+            f'<div><div class="lbl">Return</div>'
+            f'<div class="kpi sm mono {_cls}">{_ret}</div></div>'
+            f'<div><div class="lbl">Trades</div>'
+            f'<div class="kpi sm mono">{len(_tr)}</div></div>'
+            f'<div><div class="lbl">Win rate</div>'
+            f'<div class="kpi sm mono">{_wr}</div></div>'
+            f'<div><div class="lbl">Avg / trade</div>'
+            f'<div class="kpi sm mono">{_avg}</div></div>'
+            f'</div>'
+            f'<div class="dim mono" style="font-size:11.5px;margin-top:10px">'
+            f'realised {_real:+,.2f} · open {_open:+,.2f}</div>'
+            f'</div>', unsafe_allow_html=True)
 
 # ---------- strategy cards ----------
 st.markdown("")
@@ -371,7 +452,11 @@ def card(meta, active: bool):
         f'{body}</div>', unsafe_allow_html=True)
 
 
-card(ACTIVE, True)
+st.markdown("#### Open positions")
+cols = st.columns(2)
+for c, meta in zip(cols, ACTIVE):
+    with c:
+        card(meta, True)
 cols = st.columns(2)
 for c, meta in zip(cols, DISABLED):
     with c:

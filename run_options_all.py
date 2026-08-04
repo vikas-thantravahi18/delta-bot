@@ -1,12 +1,19 @@
-"""Run EVERYTHING for the BTC options strategy with one command.
+"""Run BOTH options legs plus the dashboard with one command.
 
-  py run_options_all.py             # dry-run the bot + dashboard
-  py run_options_all.py --live      # REAL orders + dashboard (one confirmation)
+  py run_options_all.py                  # dry-run both + dashboard
+  py run_options_all.py --live           # REAL orders, both legs
+  py run_options_all.py --live --only eth   # just the ETH leg
   py run_options_all.py --live --reset   # force the return counter back to zero
 
-Starts two processes:
-  * options_dip — BTC options, 5m signal, +400 pt target, 10% of wallet per trade
+Starts up to three processes:
+  * options_dip — BTC options, 5m signal, +400 pt target, 10% of wallet
+  * ut_stc      — ETH options, 4h signal, +30 pt target, 10% of wallet
   * the Streamlit dashboard -> http://localhost:8501
+
+BOTH LEGS SHARE ONE WALLET. Each sizes at 10% of the balance it reads at the
+moment it fires, so whichever trades first shrinks the stake available to the
+other. That is deliberate — it self-limits total exposure — but it means the two
+are not independent, and a big BTC position makes the next ETH trade smaller.
 
 THE DASHBOARD RESET IS AUTOMATIC AND ONE-TIME.
 data/dashboard_baseline.json fixes the capital and start time that "total return"
@@ -31,6 +38,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 RUN_OPTIONS = ROOT / "scripts" / "run_options.py"
 CONFIG = ROOT / "config.options_btc.yaml"
+ETH_CONFIG = ROOT / "config.ut_stc_eth_options.yaml"
 BASELINE = ROOT / "data" / "dashboard_baseline.json"
 
 
@@ -66,39 +74,51 @@ def main() -> None:
     ap.add_argument("--reset", action="store_true",
                     help="Reset the dashboard return counter to now + current balance.")
     ap.add_argument("--port", type=int, default=8501)
+    ap.add_argument("--only", choices=["btc", "eth"],
+                    help="Run just one leg instead of both.")
     args = ap.parse_args()
 
-    if not CONFIG.exists():
-        print(f"ERROR: config not found: {CONFIG}")
+    legs = [("btc", CONFIG), ("eth", ETH_CONFIG)]
+    if args.only:
+        legs = [(n, c) for n, c in legs if n == args.only]
+    legs = [(n, c) for n, c in legs if c.exists()]
+    if not legs:
+        print("ERROR: no config found for the requested legs.")
         return
 
     extra: list[str] = []
     if args.live:
-        print("\n*** LIVE — BTC OPTIONS (options_dip) + dashboard ***")
-        print("  target +400 BTC pts | 10% of wallet per trade | today's expiry")
-        print("  strike: every one within +/-3000 is scored on what it would return")
-        print("  on a 400-pt move; the best is bought. No cooldown, no IV ceiling.")
-        print("  no stop-loss — the option premium is the maximum loss")
-        print(f"  {CONFIG.name} must also have live.dry_run: false")
+        print("\n*** LIVE — OPTIONS + dashboard ***")
+        for n, c in legs:
+            print(f"  [{n}] {c.name}")
+        print("\n  BTC  options_dip · 5m · +400 pts · 10% · no cooldown, no IV ceiling")
+        print("  ETH  ut_stc · 4h · +30 pts · 10% · ~11 trades/month")
+        print("  Both: no stop-loss — the option premium is the maximum loss.")
+        print("  Both legs size off the SAME wallet, so they compete for balance.")
+        print("  Each config must also have live.dry_run: false")
         if input("\nType 'I UNDERSTAND' to trade real money: ").strip() != "I UNDERSTAND":
             print("Confirmation not given. Exiting.")
             return
         extra = ["--live", "--yes"]
     else:
-        print("\nDRY-RUN — no real orders. Add --live to trade.\n")
+        print("\nDRY-RUN — no real orders. Add --live to trade.")
+        for n, c in legs:
+            print(f"  [{n}] {c.name}")
+        print()
 
     ensure_baseline(force=args.reset)
 
     procs: list[tuple[str, subprocess.Popen]] = []
 
-    p = subprocess.Popen(
-        [sys.executable, "-u", str(RUN_OPTIONS), "--config", str(CONFIG), *extra],
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
-        cwd=str(ROOT),
-    )
-    procs.append(("options", p))
-    threading.Thread(target=_pump, args=(p, "options"), daemon=True).start()
-    print(f"started  options      pid={p.pid}")
+    for name, conf in legs:
+        p = subprocess.Popen(
+            [sys.executable, "-u", str(RUN_OPTIONS), "--config", str(conf), *extra],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
+            cwd=str(ROOT),
+        )
+        procs.append((name, p))
+        threading.Thread(target=_pump, args=(p, name), daemon=True).start()
+        print(f"started  {name:<12} pid={p.pid}  ({conf.name})")
 
     if importlib.util.find_spec("streamlit") is not None:
         d = subprocess.Popen(

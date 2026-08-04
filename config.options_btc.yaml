@@ -102,9 +102,11 @@ backtest:
   results_dir: results
 
 live:
-  dry_run: false           # LIVE — real orders. Still gated by the --live flag and a
-                           #        typed "I UNDERSTAND" confirmation at startup.
-                           #        Set back to true to disable instantly.
+  dry_run: true            # DISABLED 2026-08-04. Measured +$0.06/trade over a
+                           #   matched random control — statistically nothing.
+                           #   Replaced by ut_stc on ETH options, which scored
+                           #   +9.1 sd on the same test.
+                           #   Set to false to re-enable.
   poll_seconds: 60         # 60s poll — fine for a 5m signal and a 400-pt target
   order_type: market_order
 

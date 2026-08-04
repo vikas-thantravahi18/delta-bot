@@ -1,13 +1,19 @@
-"""BTC OPTIONS live trader — Trend Dip Sniper traded through the option chain.
+"""OPTIONS live trader — a signal traded through an option chain (BTC or ETH).
+
+Asset, contract size, timeframe and strategy all come from config, so the same
+engine runs options_dip on BTC 5m and ut_stc on ETH 4h without branching.
 
 HOW A TRADE WORKS
 -----------------
-1. SIGNAL   evaluated on closed 5-minute BTCUSD candles (options_dip strategy).
-2. EXPIRY   Delta BTC options settle at 12:00 UTC daily. Pick TODAY'S expiry;
-            if under `min_hours_to_expiry` remain, SKIP the signal (theta is
-            brutal in the last hours and the option can die before the target).
-3. STRIKE   at-the-money — the listed strike nearest to spot. CALL for a long
-            signal, PUT for a short one.
+1. SIGNAL   evaluated on closed candles at `market.resolution`, using whichever
+            strategy `strategy.name` selects.
+2. EXPIRY   Delta options settle at 12:00 UTC daily. Pick TODAY'S expiry; if
+            under `min_hours_to_expiry` remain, SKIP the signal (theta is brutal
+            in the last hours and the option can die before the target).
+3. STRIKE   every strike within `strike_span_points` is repriced at spot +/-
+            target after `score_hold_hours` and the best-scoring one is bought.
+            That lands slightly OTM, not ATM: measured live, the cheaper contract
+            buys enough extra lots to beat the ATM strike on a full target move.
 4. SIZE     stake = `stake_pct` of the wallet (default 10%).
             lots  = floor(stake / (premium_per_BTC x contract_value)).
             Percentage sizing is deliberate: a fixed stake cannot shrink during a
@@ -23,9 +29,14 @@ HOW A TRADE WORKS
 STATE / RESTART SAFETY
 ----------------------
 The open trade is written to data/options_state.json after every change, and on
-startup the bot reconciles that file against the exchange's real positions. If a
-position exists that the file does not know about, the bot adopts it and manages
-it to expiry rather than leaving it unmanaged.
+startup the bot reconciles that file against the exchange's real positions.
+
+Reconciliation is deliberately CONSERVATIVE. It only ever considers options on
+its own asset (`_mine`), and by default it will NOT adopt a position it has no
+state for — because adopting means closing that position at this bot's target and
+expiry window, which is wrong when the position was placed by hand or by another
+leg. Set `adopt_untracked: true` to resume managing your own trades after a
+crash, but only when no hand-placed positions are open.
 
 DRY-RUN by default. Real orders need live=True AND live.dry_run=false.
 """
@@ -46,6 +57,7 @@ from ..config import Config
 from ..data.loader import RESOLUTION_SECONDS, load_candles
 from ..exchange import DeltaClient
 from ..strategies.options_dip import OptionsDipStrategy
+from ..strategies.ut_stc import UtStcStrategy
 from .notifier import TelegramNotifier
 
 log = logging.getLogger("options")
@@ -60,8 +72,10 @@ class OpenTrade:
     product_id: int
     side: str                   # "long" (call) / "short" (put)
     lots: int
-    entry_premium: float        # per-BTC quote at entry
+    entry_premium: float        # per-unit quote at entry (per BTC / per ETH)
     stake_usd: float
+    # Named btc_* for state-file compatibility; they hold the UNDERLYING price
+    # whichever asset is configured. Renaming would orphan any live position.
     btc_entry: float
     btc_target: float
     expiry_iso: str
@@ -80,13 +94,25 @@ class OptionsTrader:
             api_secret=cfg.exchange.api_secret,
         )
         p = cfg.strategy.params or {}
-        self.strategy = OptionsDipStrategy(
-            ema_fast=p.get("ema_fast", 50), ema_slow=p.get("ema_slow", 200),
-            rsi_len=p.get("rsi_len", 14), rsi_buy=p.get("rsi_buy", 40.0),
-            rsi_sell=p.get("rsi_sell", 60.0),
-            target_points=p.get("target_points", 400.0),
-            both_sides=p.get("both_sides", True),
-        )
+        # The options trader only ever reads sig.side and sig.reason, so ANY
+        # Strategy works here. Dispatch on the configured name so BTC and ETH can
+        # run different signals through the same execution engine.
+        name = str(cfg.strategy.name or "options_dip").lower()
+        if name in ("ut_stc", "ut_stc_options"):
+            self.strategy = UtStcStrategy(
+                ut_key=p.get("ut_key", 2.0), atr_period=p.get("atr_period", 1),
+                stc_len=p.get("stc_len", 80), macd_fast=p.get("macd_fast", 27),
+                macd_slow=p.get("macd_slow", 50), zone=p.get("zone", 25.0),
+                flip_window=p.get("flip_window", 2), swing=p.get("swing", 10),
+            )
+        else:
+            self.strategy = OptionsDipStrategy(
+                ema_fast=p.get("ema_fast", 50), ema_slow=p.get("ema_slow", 200),
+                rsi_len=p.get("rsi_len", 14), rsi_buy=p.get("rsi_buy", 40.0),
+                rsi_sell=p.get("rsi_sell", 60.0),
+                target_points=p.get("target_points", 400.0),
+                both_sides=p.get("both_sides", True),
+            )
         self.target_points = float(p.get("target_points", 400.0))
         self.stake_pct = float(p.get("stake_pct", 0.10))
         self.min_hours_to_expiry = float(p.get("min_hours_to_expiry", 3.0))
@@ -104,10 +130,26 @@ class OptionsTrader:
         self.entry_cross_pct = float(p.get("entry_cross_pct", 0.15))
         self.entry_fill_seconds = int(p.get("entry_fill_seconds", 45))
         self.strike_pool = int(p.get("strike_pool", 3))
+        # --- asset wiring: BTC and ETH options differ in every dimension ------
+        # ETH is 0.01 ETH/lot on a 20-point strike grid at ~$1,860; BTC is
+        # 0.001 BTC/lot on a 200-point grid at ~$63,000. Nothing is shared, so
+        # both come from config rather than being assumed.
+        self.underlying = p.get("underlying", "BTCUSD")
+        self.option_asset = str(p.get("option_asset")
+                                or self.underlying.replace("USD", "")).upper()
+        self.lot_size = float(getattr(cfg.market, "lot_size", 0.001) or 0.001)
+        # On restart the bot finds positions it has no state for. Adopting them
+        # means it will CLOSE them at its own target or before expiry — which is
+        # wrong if they are hand-placed. Default off: leave anything untracked
+        # alone and only manage what this bot opened itself.
+        self.adopt_untracked = bool(p.get("adopt_untracked", False))
+        # Which cover name Telegram alerts use. Defaults to the strategy name so
+        # each leg is distinguishable; `notify_as` lets two legs running the same
+        # strategy on different assets be told apart.
+        self.notify_name = str(p.get("notify_as") or cfg.strategy.name or "options_dip")
         # --- strike scoring: pick the contract that gains most on a target move ---
         self.strike_span_points = float(p.get("strike_span_points", 3000.0))
         self.score_hold_hours = float(p.get("score_hold_hours", 6.0))
-        self.underlying = p.get("underlying", "BTCUSD")
 
         self.dry_run = cfg.live.dry_run or not live
         self.notifier = TelegramNotifier(
@@ -153,9 +195,12 @@ class OptionsTrader:
     # ================================================================== #
     def setup(self) -> None:
         self._load_state()
-        log.info("BTC OPTIONS trader | target +%.0f pts | stake %.0f%% of wallet | "
-                 "skip if <%.1fh to expiry | %s",
-                 self.target_points, 100 * self.stake_pct, self.min_hours_to_expiry,
+        log.info("%s OPTIONS trader | %s on %s | target +%.0f pts | "
+                 "stake %.0f%% | %.3f %s/lot | skip if <%.1fh to expiry | %s",
+                 self.option_asset, self.cfg.strategy.name,
+                 self.cfg.market.resolution, self.target_points,
+                 100 * self.stake_pct, self.lot_size, self.option_asset,
+                 self.min_hours_to_expiry,
                  "DRY-RUN (no orders)" if self.dry_run else "LIVE")
         if self.dry_run:
             log.warning("DRY-RUN: no real orders will be placed.")
@@ -164,6 +209,15 @@ class OptionsTrader:
         log.info("LIVE. Wallet $%.2f -> stake $%.2f per trade", bal, bal * self.stake_pct)
         self._reconcile()
 
+    def _mine(self, symbol: str) -> bool:
+        """Is this option on THIS trader's asset? e.g. C-ETH-... for the ETH leg.
+
+        get_option_positions() returns every option position on the account, BTC
+        and ETH alike. Without this filter the BTC leg would adopt ETH positions
+        and vice versa, and the two bots would fight over the same trade.
+        """
+        return f"-{self.option_asset}-" in str(symbol or "")
+
     def _reconcile(self) -> None:
         """Make our state agree with the exchange's real option positions."""
         try:
@@ -171,7 +225,13 @@ class OptionsTrader:
         except Exception as exc:
             log.warning("Could not fetch option positions (%s).", exc)
             return
-        live_syms = {p["product_symbol"]: p for p in positions}
+        live_syms = {p["product_symbol"]: p for p in positions
+                     if self._mine(p.get("product_symbol"))}
+        skipped = [p.get("product_symbol") for p in positions
+                   if not self._mine(p.get("product_symbol"))]
+        if skipped:
+            log.info("Ignoring %d position(s) on other assets: %s",
+                     len(skipped), ", ".join(str(s) for s in skipped))
 
         if self.open_trade and self.open_trade.symbol not in live_syms:
             log.warning("State had %s open but the exchange shows none — clearing.",
@@ -182,6 +242,11 @@ class OptionsTrader:
 
         for sym, p in live_syms.items():
             if self.open_trade and self.open_trade.symbol == sym:
+                continue
+            if not self.adopt_untracked:
+                log.warning("UNTRACKED %s position %s size=%s — NOT adopting "
+                            "(adopt_untracked: false). It is yours to manage.",
+                            self.option_asset, sym, p.get("size"))
                 continue
             log.warning("ADOPTING untracked option position %s size=%s — will manage "
                         "it to expiry.", sym, p.get("size"))
@@ -237,7 +302,7 @@ class OptionsTrader:
         mins_left = (expiry - datetime.now(timezone.utc)).total_seconds() / 60.0
 
         prem = self._premium(t.symbol)
-        pnl = ((prem - t.entry_premium) * t.lots * 0.001) if prem else 0.0
+        pnl = ((prem - t.entry_premium) * t.lots * self.lot_size) if prem else 0.0
         log.info("HOLDING %s x%d | BTC %.1f -> target %.1f (%+.0f pts to go) | "
                  "premium %.1f (entry %.1f, P&L $%+.2f) | %.0f min to expiry",
                  t.symbol, t.lots, spot, t.btc_target,
@@ -305,7 +370,7 @@ class OptionsTrader:
         optimum is an interior point and has to be searched, not assumed.
         """
         try:
-            chain = self.client.get_option_tickers("BTC")
+            chain = self.client.get_option_tickers(self.option_asset)
         except Exception as exc:
             log.error("Could not fetch option chain (%s).", exc)
             return None
@@ -400,16 +465,16 @@ class OptionsTrader:
         spread_pct = (100.0 * (ask - bid) / mark) if bid > 0 else 999.0
         if spread_pct > self.max_spread_pct:
             return None
-        lots = int(stake / (ask * 0.001))
+        lots = int(stake / (ask * self.lot_size))
         if lots < 1:
             return None
-        cost = lots * ask * 0.001
+        cost = lots * ask * self.lot_size
         hold = min(self.score_hold_hours, max(hours_left - 0.5, 0.1))
         t1 = max((hours_left - hold) / 24.0 / 365.0, 1e-9)
         s1 = spot + (self.target_points if want_call else -self.target_points)
         fair = self._bs(s1, strike, t1, iv, want_call)
         edge = (ask - bid) / 2.0 if bid > 0 else fair * 0.06
-        proceeds = lots * max(fair - edge, 0.0) * 0.001
+        proceeds = lots * max(fair - edge, 0.0) * self.lot_size
         return dict(pnl=proceeds - cost, lots=lots, cost=cost, ask=ask, bid=bid,
                     iv=iv, spread_pct=spread_pct)
 
@@ -430,7 +495,7 @@ class OptionsTrader:
         balance = self._balance() if balance is None else balance
         stake = balance * self.stake_pct
         # pay the ask when buying at market; premium is quoted per 1 BTC
-        prem_per_lot = pick["ask"] * 0.001
+        prem_per_lot = pick["ask"] * self.lot_size
         if prem_per_lot <= 0:
             log.error("Bad premium for %s.", pick["symbol"])
             return
@@ -464,7 +529,7 @@ class OptionsTrader:
             self._trades_today += 1
             self.last_entry_iso = datetime.now(timezone.utc).isoformat()
             # notify in dry-run too, so the Telegram wiring is proven before real money
-            self.notifier.notify_trade("options_dip", sig.side, lots)
+            self.notifier.notify_trade(self.notify_name, sig.side, lots)
             return
 
         if pick["spread_pct"] > self.max_spread_pct:
@@ -559,13 +624,13 @@ class OptionsTrader:
         self._trades_today += 1
         self.last_entry_iso = self.open_trade.opened_iso
         self._save_state()
-        self.notifier.notify_trade("options_dip", sig.side, lots)
+        self.notifier.notify_trade(self.notify_name, sig.side, lots)
 
     # ------------------------------------------------------------------ #
     def _close(self, why: str) -> None:
         t = self.open_trade
         prem = self._premium(t.symbol) or 0.0
-        pnl = (prem - t.entry_premium) * t.lots * 0.001
+        pnl = (prem - t.entry_premium) * t.lots * self.lot_size
         msg = (f"CLOSE {t.symbol} x{t.lots} — {why} | premium {t.entry_premium:.1f} -> "
                f"{prem:.1f} | P&L ${pnl:+.2f}")
         if self.dry_run:
@@ -581,7 +646,7 @@ class OptionsTrader:
                 log.error("CLOSE FAILED for %s: %s — position left open, will retry "
                           "next tick.", t.symbol, exc)
                 return
-        self.notifier.notify_close("options_dip", pnl, why)
+        self.notifier.notify_close(self.notify_name, pnl, why)
         self.open_trade = None
         self.last_exit_iso = datetime.now(timezone.utc).isoformat()
         self._save_state()

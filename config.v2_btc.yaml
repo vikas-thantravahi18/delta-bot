@@ -20,10 +20,14 @@ account:
   starting_balance: 100.0  # fallback only; live sizing reads the API balance
 
 risk:
-  capital_allocation_pct: 0.50   # MARGIN mode: deploy 50% of the wallet AS MARGIN per BTC trade
-  sizing_mode: margin            # big, fixed-notional positions. Per-trade risk ~20-27% of wallet
-                                  #   with the strategy's native stop -- user manages exits manually.
-  risk_per_trade_usd: 3.0        # ignored in margin mode (fallback if switched back to sizing_mode: risk)
+  capital_allocation_pct: 0.50   # ignored while allocation_usd is set
+  sizing_mode: margin
+  allocation_usd: 20.0           # FLAT $20 of margin per trade, whatever the balance.
+                                 # At max_leverage 10 that is $200 of notional.
+                                 # Was 50% of wallet — on a $67 balance that meant
+                                 # ~$33 margin and ~$335 notional, and it grew with
+                                 # the account. This does not.
+  risk_per_trade_usd: 3.0        # ignored in margin mode (fallback if switched to sizing_mode: risk)
   risk_per_trade_pct: null
   reward_risk_ratio: 3.0         # RR 1:3 (validated)
   max_trades_per_day: 4
@@ -45,9 +49,12 @@ backtest:
   results_dir: results
 
 live:
-  dry_run: true                  # DISABLED 2026-08-02 — replaced by the BTC options
-                                 # strategy (config.options_btc.yaml). Set back to
-                                 # false to re-enable this leg.
+  dry_run: false                 # RE-ENABLED 2026-08-04. Shares the BTC slot with
+                                 # ema_rsi via src/live/market_lock.py — whichever
+                                 # fires first takes it, the other skips.
+                                 # NOTE margin mode: 50% of wallet as margin at up
+                                 # to 10x. Far more exposure per trade than the
+                                 # options legs, whose loss is capped at the premium.
   poll_seconds: 60
   order_type: market_order
 

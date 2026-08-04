@@ -1,0 +1,123 @@
+# =====================================================================
+# ETH OPTIONS — "ut_stc" (UT Bot + Schaff Trend Cycle) on the ETH chain.
+#
+# NOTE: this is the OPTIONS version. config.ut_stc_eth.yaml is the older
+# PERP version (RR brackets, portfolio leg 2) — different engine, left alone.
+#
+#   signal   4h ETHUSD: UT-Bot ATR trailing-stop flip + STC confirmation
+#   trade    buy the best-scoring ETH option on TODAY'S expiry (call / put)
+#   target   ETH +30 points -> sell to close at market
+#   stop     NONE. The premium is the maximum loss.
+#   size     10% of wallet per trade
+#
+# WHY ETH AND NOT BTC
+#   ut_stc was built for ETH and its own docstring says "dead on BTC".
+#   Measured on 909 days of real Delta ETHUSD resampled to 4h, $150 wallet,
+#   10% sizing, real fees, real ETH contract specs (0.01 ETH/lot, 20-pt grid,
+#   spread curve fitted to the live chain):
+#
+#     11.3 trades/month | 74.0% win | 42.3% max drawdown | worst run 5
+#     +$2.54/trade with IV tracking realised vol   (pessimistic)
+#     +$8.52/trade with IV flat at today's 40.5%   (optimistic)
+#
+#   Validation it passed that nothing else in this project did:
+#     * +9.1 sd over a MATCHED random control, beat 100% of 20 seeds
+#     * long AND short both profitable alone (71.3% / 77.1%)
+#     * positive in 2024 (ETH +43%), 2025 (-11%) and 2026 (-37%)
+#     * 5 of 5 walk-forward six-month blocks positive
+#     * no lookahead — delaying the signal one bar costs 4%
+#
+#   TUNING vs the stock strategy: ut_key 2.0 -> 1.0, zone 25 -> 40. Both
+#   raised win rate AND trade count AND lowered drawdown. 26 of 26 in-sample
+#   winners in a 48-config sweep survived the split (chance gives 13).
+#
+# EXPIRY: today's, not tomorrow's. Median time to target is 2.7h against a
+# ~19h contract life. The next day's contract halves position size to buy
+# 9 points of hit rate — measured +$13.20/trade vs +$4.49.
+#
+# DRY-RUN by default. Needs live.dry_run: false AND --live to trade real money.
+# =====================================================================
+
+exchange:
+  region: india
+
+market:
+  symbol: ETHUSD
+  resolution: "4h"        # ut_stc is validated on 4h — NOT 5m
+  trend_resolution: "1d"  # unused by this strategy
+  lot_size: 0.01          # Delta ETH option contract = 0.01 ETH (BTC is 0.001)
+  min_lots: 1
+
+account:
+  starting_balance: 150.0  # fallback + dry-run sizing; live reads the API balance
+
+risk:
+  # Options sizing comes from strategy.params.stake_pct, NOT this block. These
+  # fields exist only because the shared Config validator requires them.
+  capital_allocation_pct: 1.0
+  sizing_mode: risk
+  risk_per_trade_usd: null
+  risk_per_trade_pct: 0.10
+  reward_risk_ratio: 1.0
+  max_trades_per_day: 4      # 4h bars cap this at 6/day; measured rate is 0.37/day
+  max_open_positions: 1
+  max_leverage: 1            # buying options is not leveraged; no liquidation
+  trail_distance_r: null
+
+strategy:
+  name: ut_stc
+  params:
+    underlying: ETHUSD
+    option_asset: ETH        # which option chain to fetch
+
+    # --- ut_stc signal, TUNED (see header for what changed and why) ---------
+    ut_key: 1.0              # was 2.0 — a tighter ATR trail flips sooner
+    atr_period: 1
+    stc_len: 80
+    macd_fast: 27
+    macd_slow: 50
+    zone: 40.0               # was 25.0 — looser STC gate admits more setups
+    flip_window: 2
+    swing: 10
+
+    target_points: 30.0      # ETH points (~1.61%). BTC's 400 is 0.63%, so this
+                             # is deliberately a larger move — ETH realises
+                             # 65.8% vol against BTC's 43.5%.
+    stake_pct: 0.10
+
+    min_hours_to_expiry: 3.0     # skip signals inside 3h of the 12:00 UTC settlement
+    close_before_expiry_min: 20  # flatten 20 min before settlement if target unhit
+    cooldown_hours: 0.0          # 4h bars space the trades; no extra cooldown needed
+    max_iv: null                 # OFF — the strike scorer prices what each contract
+                                 # would actually return, so a fixed ceiling is redundant
+
+    # --- strike selection ---------------------------------------------------
+    strike_span_points: 200.0    # ETH grid is 20 pts, so this covers 10 strikes
+                                 # either side. Wider is pointless: ETH books blow
+                                 # out fast — 46% spread at a $0.65 premium.
+    score_hold_hours: 6.0        # measured mean hold 5.9h
+
+    # --- execution ----------------------------------------------------------
+    # ETH ATM spread measured 3.1% on the front expiry, 1.2-2.0% further out.
+    # Book depth at the money: 6,192 lots offered against the ~153 a $15 stake
+    # buys, and 11,614 bid to exit.
+    max_spread_pct: 12.0
+    entry_order_type: market
+    entry_cross_pct: 0.15        # limit mode only
+    entry_fill_seconds: 45
+    strike_pool: 3               # unused by the scorer; kept so older configs load
+
+backtest:
+  fee_rate: 0.0005
+  slippage_rate: 0.0002
+  results_dir: results
+
+live:
+  dry_run: false           # LIVE — real orders. Still gated by the --live flag
+                           #        and a typed "I UNDERSTAND" at startup.
+                           #        Set back to true to disable instantly.
+  poll_seconds: 60
+  order_type: market_order
+
+notify:
+  enabled: true

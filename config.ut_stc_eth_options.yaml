@@ -10,15 +10,35 @@
 #   stop     NONE. The premium is the maximum loss.
 #   size     10% of wallet per trade
 #
-# WHY ETH AND NOT BTC
-#   ut_stc was built for ETH and its own docstring says "dead on BTC".
+# NUMBERS CORRECTED 2026-08-05 — the old ones assumed IV, this measures it.
+#   Everything below previously rested on a FLAT 40.5% IV taken from one day of
+#   the live chain. IV is now backed out of 17,053 real historical option prices
+#   from Delta's own expired-contract marks (2024-02 to 2026-07), plus the real
+#   term structure by hours-to-expiry (0.60 at 0-4h rising to 0.91 at 20-27h).
+#   True median short-dated ETH IV is 52.5%, not 40.5% — options were being
+#   priced ~8% too cheap, and every earlier figure here was too generous.
+#
 #   Measured on 909 days of real Delta ETHUSD resampled to 4h, $150 wallet,
 #   10% sizing, real fees, real ETH contract specs (0.01 ETH/lot, 20-pt grid,
 #   spread curve fitted to the live chain):
 #
-#     11.3 trades/month | 74.0% win | 42.3% max drawdown | worst run 5
-#     +$2.54/trade with IV tracking realised vol   (pessimistic)
-#     +$8.52/trade with IV flat at today's 40.5%   (optimistic)
+#     11.4 trades/month | 75% win | 77% target-hit | 3.1h median hold
+#     43% max drawdown  | +6.7 sd over a matched random control (loses $1.48)
+#     +$3.74/trade idealised   (was quoted +$8.52 under the wrong IV)
+#     +$2.42/trade after ALL FIVE stress assumptions at once
+#     typical 1mo +28%, 3mo +149%, 6mo +690%
+#
+# TARGET 30 IS YOUR CHOICE, NOT THE OPTIMUM
+#   Under measured IV the risk-adjusted peak moved DOWN to 20 points:
+#     20 pts -> +8.5 sd, 30% drawdown, +$1.71/trade (+$1.23 stressed)
+#     25 pts -> +7.7 sd, 35% drawdown, +$2.72/trade
+#     30 pts -> +6.7 sd, 43% drawdown, +$3.74/trade   <-- configured
+#   30 buys more dollars per trade for a materially deeper drawdown. 20 is the
+#   safer revert if the drawdown proves uncomfortable in practice.
+#
+# CORRELATION WITH THE BTC LEG — see config.ut_stc_btc_options.yaml. The two
+#   are +0.64 correlated while overlapping and both run at 10%, so combined
+#   drawdown measured 62% against 43% for this leg alone.
 #
 #   Validation it passed that nothing else in this project did:
 #     * +9.1 sd over a MATCHED random control, beat 100% of 20 seeds
@@ -86,7 +106,20 @@ strategy:
     stake_pct: 0.10
 
     min_hours_to_expiry: 3.0     # skip signals inside 3h of the 12:00 UTC settlement
-    close_before_expiry_min: 20  # flatten 20 min before settlement if target unhit
+    close_before_expiry_min: 5   # flatten 5 min before settlement if target unhit.
+                                 # Measured across 60/30/20/10/5/0m: no difference
+                                 # worth the name ($3.75 -> $3.76/trade, identical
+                                 # 77% target-hit). Median hold is 3.1h against a
+                                 # 14-24h contract, so few trades are still open
+                                 # when this window matters at all.
+                                 # THE TRADE-OFF IS OPERATIONAL, NOT STATISTICAL:
+                                 # the bot polls every 60s, so 5 min leaves ~5
+                                 # retries if a close order fails, against ~20
+                                 # before. If every retry fails the option goes to
+                                 # settlement, which pays intrinsic — so the real
+                                 # cost is losing residual time value on an ITM
+                                 # contract, not a blow-up. Raise back to 20 if you
+                                 # ever see CLOSE FAILED repeating in the log.
     cooldown_hours: 0.0          # 4h bars space the trades; no extra cooldown needed
     max_iv: null                 # OFF — the strike scorer prices what each contract
                                  # would actually return, so a fixed ceiling is redundant

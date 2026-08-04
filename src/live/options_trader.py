@@ -303,14 +303,14 @@ class OptionsTrader:
 
         prem = self._premium(t.symbol)
         pnl = ((prem - t.entry_premium) * t.lots * self.lot_size) if prem else 0.0
-        log.info("HOLDING %s x%d | BTC %.1f -> target %.1f (%+.0f pts to go) | "
+        log.info("HOLDING %s x%d | %s %.1f -> target %.1f (%+.0f pts to go) | "
                  "premium %.1f (entry %.1f, P&L $%+.2f) | %.0f min to expiry",
-                 t.symbol, t.lots, spot, t.btc_target,
+                 t.symbol, t.lots, self.option_asset, spot, t.btc_target,
                  (t.btc_target - spot) if t.side == "long" else (spot - t.btc_target),
                  prem or 0.0, t.entry_premium, pnl, mins_left)
 
         if hit:
-            self._close("TARGET HIT (+%.0f BTC pts)" % self.target_points)
+            self._close("TARGET HIT (+%.0f %s pts)" % (self.target_points, self.option_asset))
         elif mins_left <= self.close_before_expiry_min:
             self._close("EXPIRY in %.0f min" % mins_left)
 
@@ -336,8 +336,19 @@ class OptionsTrader:
         prepared = self.strategy.prepare(df)
         sig = self.strategy.signal(prepared, i)
         if sig is None:
-            log.info("[%s] no signal (BTC %.1f, RSI %.1f)",
-                     bar_time, float(df.iloc[i]["close"]), float(prepared.iloc[i]["rsi"]))
+            # Log whatever indicator columns THIS strategy produced. options_dip
+            # has 'rsi'; ut_stc has none of the same names. Naming a column here
+            # would crash the whole tick on any strategy that lacks it.
+            extra = ""
+            for col in ("rsi", "stc", "ema_fast"):
+                if col in prepared.columns:
+                    try:
+                        extra = f", {col.upper()} {float(prepared.iloc[i][col]):.1f}"
+                    except (TypeError, ValueError):
+                        pass
+                    break
+            log.info("[%s] no signal (%s %.1f%s)", bar_time, self.option_asset,
+                     float(df.iloc[i]["close"]), extra)
             return
         log.info("SIGNAL %s | %s", sig.side.upper(), sig.reason)
 
@@ -518,8 +529,8 @@ class OptionsTrader:
 
         msg = (f"{'BUY CALL' if sig.side == 'long' else 'BUY PUT'} {pick['symbol']} "
                f"x{lots} lots | strike {pick['strike']:,.0f} ({pick['strike']-spot:+,.0f}) "
-               f"best of {pick.get('considered', 1)} | premium {pick['ask']:.1f}/BTC = "
-               f"${cost:.2f} ({100*cost/balance:.1f}% of ${balance:.2f}) | BTC {spot:.1f} "
+               f"best of {pick.get('considered', 1)} | premium {pick['ask']:.1f}/{self.option_asset} = "
+               f"${cost:.2f} ({100*cost/balance:.1f}% of ${balance:.2f}) | {self.option_asset} {spot:.1f} "
                f"-> target {target:.1f} | IV {100*pick['iv']:.1f}% delta {pick['delta']:.2f} "
                f"spread {pick['spread_pct']:.1f}% | {pick['hours_left']:.1f}h to expiry | "
                f"est +${est_gain:.2f} at target")
@@ -646,6 +657,16 @@ class OptionsTrader:
                 log.error("CLOSE FAILED for %s: %s — position left open, will retry "
                           "next tick.", t.symbol, exc)
                 return
+            # The quote above is what we HOPED to get. A market sell takes the bid
+            # and can land below it, so re-derive the P&L from the actual fill —
+            # otherwise the logged and notified figures overstate the result.
+            got = self._exit_fill(t.symbol, t.lots)
+            if got is not None and got > 0:
+                real = (got - t.entry_premium) * t.lots * self.lot_size
+                if abs(real - pnl) >= 0.01:
+                    log.info("       filled %.2f (quoted %.2f) | REAL P&L $%+.2f",
+                             got, prem, real)
+                pnl = real
         self.notifier.notify_close(self.notify_name, pnl, why)
         self.open_trade = None
         self.last_exit_iso = datetime.now(timezone.utc).isoformat()
@@ -713,6 +734,37 @@ class OptionsTrader:
                         return px
             except Exception as exc:
                 log.warning("fill check failed (%s), retrying.", exc)
+        return None
+
+    def _exit_fill(self, symbol: str, lots: int) -> Optional[float]:
+        """Size-weighted average price of the sell fills that closed `symbol`.
+
+        The mirror of `_await_fill`: on entry the position appears and carries an
+        entry_price, but on exit it vanishes, so the price has to come from the
+        fills feed instead. Returns None if nothing is readable — the caller then
+        keeps the quote-based figure rather than inventing one.
+        """
+        deadline = time.time() + self.entry_fill_seconds
+        while time.time() < deadline:
+            time.sleep(3)
+            try:
+                qty = px = 0.0
+                for f in self.client.get_fills(page_size=100):
+                    if str(f.get("product_symbol")) != symbol or str(f.get("side")) != "sell":
+                        continue
+                    sz = abs(float(f.get("size") or 0))
+                    if sz <= 0:
+                        continue
+                    qty += sz
+                    px += sz * float(f.get("price") or 0)
+                    if qty >= lots:       # newest-first, so this is the closing batch
+                        break
+                if qty > 0:
+                    return px / qty
+            except Exception as exc:
+                log.warning("exit fill check failed (%s), retrying.", exc)
+        log.warning("could not read the exit fill for %s — P&L logged from the "
+                    "last quote, which may differ from the realised figure.", symbol)
         return None
 
     @staticmethod

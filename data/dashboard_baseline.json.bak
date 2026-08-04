@@ -1,0 +1,5 @@
+{
+ "starting_capital": 155.5869,
+ "strategy_start": "2026-08-02T06:22:34.264413+00:00",
+ "note": "Dashboard counts only option fills at/after strategy_start. Re-run scripts/reset_dashboard.py to restart the counter."
+}

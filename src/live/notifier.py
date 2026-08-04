@@ -6,11 +6,16 @@ what you did. To you it decodes cleanly; to everyone else it's just an anime ale
 
 DECODER KEY  (keep this private):
     Which anime  ->  which strategy fired
-        Demon Slayer     = options_dip    (BTC options — the live strategy)
-        One Piece        = v2_dualtrend   (BTCUSD 1h)
-        Naruto           = ema_rsi_atr    (BTCUSD 30m)
-        Jujutsu Kaisen   = ut_stc         (ETHUSD 4h)
+        One Piece        = ut_stc on BTC OPTIONS  (4h, +600 pts)   <- LIVE
+        Jujutsu Kaisen   = ut_stc on ETH OPTIONS  (4h, +30 pts)    <- LIVE
+        Demon Slayer     = options_dip   (BTC options 5m)          -- disabled
+        Naruto           = ema_rsi_atr   (BTCUSD perp 30m)         -- disabled
         Bleach           = any other strategy
+
+    NOTE One Piece is shared with v2_dualtrend (BTCUSD perp 1h), which is
+    currently disabled. If you ever re-enable v2 alongside the BTC options leg,
+    both will alert as One Piece — give one of them a different name in ANIME
+    below before doing so.
 
   OPENING a trade
     "new Episode ... dropped"   = a LONG was opened   (a CALL, for options)
@@ -48,11 +53,17 @@ import urllib.request
 log = logging.getLogger("live")
 
 # strategy name -> cover anime. Add your own; unknown strategies use DEFAULT_ANIME.
+#
+# The key is what the leg reports as its name, which for the options legs is
+# strategy.params.notify_as, NOT the strategy class. Both ut_stc option legs are
+# the same strategy on different chains, so without separate keys BTC and ETH
+# would send byte-identical alerts and you could not tell which fired.
 ANIME = {
     "options_dip": "Demon Slayer",
     "v2_dualtrend": "One Piece",
+    "ut_stc_btc": "One Piece",       # ut_stc on the BTC option chain
     "ema_rsi_atr": "Naruto",
-    "ut_stc": "Jujutsu Kaisen",
+    "ut_stc": "Jujutsu Kaisen",      # ut_stc on the ETH option chain
 }
 DEFAULT_ANIME = "Bleach"
 

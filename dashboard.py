@@ -3,8 +3,9 @@
   pip install streamlit
   streamlit run dashboard.py
 
-Shows the ACTIVE strategy (BTC options — options_dip) plus the disabled perp legs,
-the account balance, TOTAL RETURN %, and a trade history with REAL P&L.
+Shows the two ACTIVE legs — ut_stc on the BTC option chain (+600 pts) and on the
+ETH option chain (+30 pts), each sized at 10% of the wallet — plus the disabled
+legs, the account balance, TOTAL RETURN %, and a trade history with REAL P&L.
 
 Why P&L has to be computed here
 -------------------------------
@@ -17,12 +18,17 @@ blank. This dashboard pairs fills FIFO per symbol and computes
 Verified against a real round trip: P-BTC-63400 bought 150 @451, sold @905.9
 -> +$66.01 net, which matches Delta's own "ROE 100.86%" on that position.
 
-SCOPE — this strategy only
---------------------------
-Everything on this page counts ONLY the active strategy: option fills (C-BTC /
-P-BTC) dated on or after `strategy_start` in data/dashboard_baseline.json. Older
-perp trades and any manual option trades from before that timestamp are excluded,
-so the win rate, P&L and total return describe options_dip and nothing else.
+SCOPE — the active legs only
+----------------------------
+Everything on this page counts option fills (C-BTC / P-BTC / C-ETH / P-ETH) dated
+on or after `strategy_start` in data/dashboard_baseline.json. Older perp trades
+and any manual option trades from before that timestamp are excluded.
+
+That date is doing real work on the BTC card. A fill does not record which
+strategy placed it, and the retired options_dip traded the SAME C-BTC/P-BTC
+symbols as ut_stc does now. If the baseline predates ut_stc going live, its 28
+old round trips (-$23.50) are counted here as ut_stc's. Re-base before reading
+the BTC numbers.
 
     py scripts/reset_dashboard.py     # re-baseline to now + current balance
 
@@ -51,19 +57,30 @@ ETH_CONTRACT = 0.01
 # Both option legs are tracked. BTC and ETH have different contract sizes,
 # different strategies and different targets, so they get separate scorecards —
 # a blended number would hide which one is actually working.
-# Options legs get per-asset scorecards below; the perp legs share the BTC slot
-# via market_lock so they are shown as one card.
+#
+# UPDATED 05 Aug: ut_stc now runs on the BTC chain too, and the perp legs are off.
+#
+# A WARNING ABOUT THE BTC CARD. Fills are matched by SYMBOL, and ut_stc-on-BTC
+# and the retired options_dip both trade C-BTC/P-BTC — nothing in a fill says
+# which strategy placed it. They are told apart only by DATE, via strategy_start
+# in data/dashboard_baseline.json. So the BTC card is honest ONLY if that
+# baseline is on or after the moment ut_stc went live; otherwise options_dip's
+# old 28 round trips (-$23.50) are silently counted as ut_stc's.
+#   ->  run  py scripts/reset_dashboard.py  before trusting the BTC numbers.
 ACTIVE = [
+    {"name": "ut_stc", "asset": "BTC",
+     "market": "BTC options · 4h · +600 pts · 10% stake",
+     "tok": "₿", "color": "#f7931a",
+     "match": lambda s: s.startswith(("C-BTC", "P-BTC"))},
     {"name": "ut_stc", "asset": "ETH",
      "market": "ETH options · 4h · +30 pts · 10% stake",
      "tok": "Ξ", "color": "#6f7ce8",
      "match": lambda s: s.startswith(("C-ETH", "P-ETH"))},
-    {"name": "v2 + ema_rsi", "asset": "BTC-perp",
-     "market": "BTCUSD perp · 1h + 30m · margin 50% @ 10x",
-     "tok": "₿", "color": "#f7931a",
-     "match": lambda s: s == "BTCUSD"},
 ]
 DISABLED = [
+    {"name": "v2 + ema_rsi", "market": "BTCUSD perp · 1h + 30m — disabled 05 Aug",
+     "tok": "₿", "color": "#3d4759",
+     "match": lambda s: s == "BTCUSD"},
     {"name": "options_dip", "market": "BTC options · 5m — disabled 04 Aug",
      "tok": "◆", "color": "#3d4759",
      "match": lambda s: s.startswith(("C-BTC", "P-BTC"))},

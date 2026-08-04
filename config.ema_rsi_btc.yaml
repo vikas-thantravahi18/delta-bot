@@ -59,12 +59,16 @@ backtest:
   results_dir: results
 
 live:
-  dry_run: false                 # RE-ENABLED 2026-08-04. Shares the BTC slot with
-                                 # v2 via src/live/market_lock.py — whichever fires
-                                 # first takes it, the other skips.
-                                 # NOTE margin mode: 50% of wallet as margin at up
-                                 # to 10x. Far more exposure per trade than the
-                                 # options legs, whose loss is capped at the premium.
+  dry_run: true                  # DISABLED 2026-08-05 at your request, so the two
+                                 # ut_stc OPTIONS legs (BTC + ETH) are the only
+                                 # things trading. Nothing wrong with this strategy
+                                 # was found — it is switched off, not retired.
+                                 # Set back to false to re-enable; it will resume
+                                 # sharing the BTC perp slot with v2 via
+                                 # src/live/market_lock.py.
+                                 # NOTE if you do: margin mode at up to 10x is far
+                                 # more exposure per trade than an option, whose
+                                 # loss is capped at the premium paid.
   poll_seconds: 60
   order_type: market_order
 

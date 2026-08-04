@@ -38,9 +38,13 @@ RUN_OPTIONS = ROOT / "scripts" / "run_options.py"
 BASELINE = ROOT / "data" / "dashboard_baseline.json"
 
 # tag, config file, is_options
+# Every known leg is listed here; live.dry_run in each file decides which of
+# them actually start. A leg missing from this list can never run, however its
+# config is set — so add new configs here or they are silently ignored.
 LEGS = [
-    ("btc-opt", "config.options_btc.yaml", True),
-    ("eth-opt", "config.ut_stc_eth_options.yaml", True),
+    ("utstc-btc-opt", "config.ut_stc_btc_options.yaml", True),
+    ("utstc-eth-opt", "config.ut_stc_eth_options.yaml", True),
+    ("dip-btc-opt", "config.options_btc.yaml", True),
     ("v2/BTC", "config.v2_btc.yaml", False),
     ("ema/BTC", "config.ema_rsi_btc.yaml", False),
     ("ut_stc/ETH", "config.ut_stc_eth.yaml", False),
